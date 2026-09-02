@@ -1,0 +1,1 @@
+/usr/bin/cc -Wl,--dependency-file=CMakeFiles/Oopsie.dir/link.d CMakeFiles/Oopsie.dir/src/main.c.o -o Oopsie  -ldl
