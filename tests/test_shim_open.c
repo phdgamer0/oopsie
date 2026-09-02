@@ -9,7 +9,11 @@
 extern OopWalContext GlobalWal;
 
 void true_unlink(const char* path) {
+    #ifdef SYS_unlink
     syscall(SYS_unlink, path);
+    #else
+    syscall(SYS_unlinkat, AT_FDCWD, path, 0);
+    #endif
 }
 
 int main() {
