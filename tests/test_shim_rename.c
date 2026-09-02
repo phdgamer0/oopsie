@@ -26,7 +26,11 @@ int main() {
     true_unlink(new_target);
 
     // Setup: create old file (bypassing shim to avoid noise, though noise is fine)
+    #ifdef SYS_open
     int fd = syscall(SYS_open, old_target, O_CREAT | O_WRONLY, 0644);
+    #else
+    int fd = syscall(SYS_openat, AT_FDCWD, old_target, O_CREAT | O_WRONLY, 0644);
+    #endif
     if (fd < 0) {
         printf("[TEST] Failed to setup file\n");
         return 1;
