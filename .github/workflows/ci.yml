@@ -1,0 +1,89 @@
+name: Oopsie CI
+
+on:
+  push:
+    branches:
+      - linux_user
+
+jobs:
+  test_on_os:
+    name: Test on ${{ matrix.container }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        container:
+          - ubuntu:22.04
+          - debian:bookworm
+          - fedora:latest
+          - archlinux:latest
+
+    container: ${{ matrix.container }}
+
+    steps:
+      - name: Install dependencies (Debian/Ubuntu)
+        if: contains(matrix.container, 'ubuntu') || contains(matrix.container, 'debian')
+        run: apt-get update && apt-get install -y git cmake gcc make time coreutils
+
+      - name: Install dependencies (Fedora)
+        if: contains(matrix.container, 'fedora')
+        run: dnf install -y git cmake gcc make time coreutils
+
+      - name: Install dependencies (Arch Linux)
+        if: contains(matrix.container, 'archlinux')
+        run: pacman -Sy --noconfirm git cmake gcc make time coreutils
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build Project
+        run: make build
+
+      - name: Run Standard Tests
+        run: make test
+
+      - name: Allocate Big Files & Test Speed
+        run: |
+          mkdir -p /tmp/oopsie
+          echo "Allocating 1GB file..."
+          dd if=/dev/zero of=/tmp/bigfile.dat bs=1M count=1024
+          echo "Testing LD_PRELOAD on big file renaming..."
+          /usr/bin/time -v env LD_PRELOAD=./build/liboopsie_shim.so mv /tmp/bigfile.dat /tmp/bigfile_renamed.dat
+          echo "Testing LD_PRELOAD on big file deletion..."
+          /usr/bin/time -v env LD_PRELOAD=./build/liboopsie_shim.so rm /tmp/bigfile_renamed.dat
+
+      - name: Run Binaries Directly
+        run: |
+          ./build/test_wal_basic
+          ./build/test_wal_boundary
+          ./build/test_wal_speed
+          ./build/test_shim_basic
+          ./build/test_shim_boundary
+          env LD_PRELOAD=./build/liboopsie_shim.so ./build/test_shim_speed
+          env LD_PRELOAD=./build/liboopsie_shim.so ./build/test_shim_open
+          env LD_PRELOAD=./build/liboopsie_shim.so ./build/test_shim_rename
+
+  test_on_arm64:
+    name: Test on ARM64 (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Run tests in ARM64 container
+        uses: addnab/docker-run-action@v3
+        with:
+          image: arm64v8/ubuntu:22.04
+          options: -v ${{ github.workspace }}:/workspace -w /workspace
+          run: |
+            apt-get update && apt-get install -y cmake gcc make time coreutils
+            make build
+            make test
+            mkdir -p /tmp/oopsie
+            dd if=/dev/zero of=/tmp/bigfile.dat bs=1M count=1024
+            time env LD_PRELOAD=./build/liboopsie_shim.so mv /tmp/bigfile.dat /tmp/bigfile_renamed.dat
+            time env LD_PRELOAD=./build/liboopsie_shim.so rm /tmp/bigfile_renamed.dat
+            env LD_PRELOAD=./build/liboopsie_shim.so ./build/test_shim_speed
