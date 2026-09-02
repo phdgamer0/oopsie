@@ -57,8 +57,8 @@ jobs:
           ./build/test_wal_basic
           ./build/test_wal_boundary
           ./build/test_wal_speed
-          ./build/test_shim_basic
-          ./build/test_shim_boundary
+          env LD_PRELOAD=./build/liboopsie_shim.so ./build/test_shim_basic
+          env LD_PRELOAD=./build/liboopsie_shim.so ./build/test_shim_boundary
           env LD_PRELOAD=./build/liboopsie_shim.so ./build/test_shim_speed
           env LD_PRELOAD=./build/liboopsie_shim.so ./build/test_shim_open
           env LD_PRELOAD=./build/liboopsie_shim.so ./build/test_shim_rename
@@ -86,4 +86,6 @@ jobs:
             dd if=/dev/zero of=/tmp/bigfile.dat bs=1M count=1024
             time env LD_PRELOAD=./build/liboopsie_shim.so mv /tmp/bigfile.dat /tmp/bigfile_renamed.dat
             time env LD_PRELOAD=./build/liboopsie_shim.so rm /tmp/bigfile_renamed.dat
+            env LD_PRELOAD=./build/liboopsie_shim.so ./build/test_shim_basic
+            env LD_PRELOAD=./build/liboopsie_shim.so ./build/test_shim_boundary
             env LD_PRELOAD=./build/liboopsie_shim.so ./build/test_shim_speed
