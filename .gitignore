@@ -1,0 +1,14 @@
+build/
+.cache/
+.agent/*
+*.exe
+*.o
+*.so
+*.a
+*.obj
+*.lib
+*.dll
+*.dSYM
+*.py
+*.pyc
+*.pyo
