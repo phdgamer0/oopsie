@@ -1,0 +1,6 @@
+Language: C
+ColumnLimit: 0
+IndentWidth: 3
+UseTab: Always
+PointerAlignment: Left
+AllowShortFunctionsOnASingleLine: None

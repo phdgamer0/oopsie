@@ -1,3 +1,0 @@
-/home/phd/Desktop/CStuff/Projects/oopsie/build/CMakeFiles/Oopsie.dir
-/home/phd/Desktop/CStuff/Projects/oopsie/build/CMakeFiles/edit_cache.dir
-/home/phd/Desktop/CStuff/Projects/oopsie/build/CMakeFiles/rebuild_cache.dir

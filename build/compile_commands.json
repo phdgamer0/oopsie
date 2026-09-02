@@ -1,8 +1,0 @@
-[
-{
-  "directory": "/home/phd/Desktop/CStuff/Projects/oopsie/build",
-  "command": "/usr/bin/cc  -I/home/phd/Desktop/CStuff/Projects/oopsie/include -I/home/phd/Desktop/CStuff/Projects/oopsie/src -O3 -Wall -Wextra -pedantic -o CMakeFiles/Oopsie.dir/src/main.c.o -c /home/phd/Desktop/CStuff/Projects/oopsie/src/main.c",
-  "file": "/home/phd/Desktop/CStuff/Projects/oopsie/src/main.c",
-  "output": "CMakeFiles/Oopsie.dir/src/main.c.o"
-}
-]

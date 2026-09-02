@@ -6,6 +6,11 @@ build: clear
 	cmake --build build
 	@echo "done"
 
+test: build
+	@echo "Running tests..."
+	cd build && ctest --output-on-failure
+	@echo "Tests done"
+
 clear:
 	@echo "Clearing the folder..."
 	rm -rf build
