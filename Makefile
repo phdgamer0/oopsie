@@ -8,6 +8,8 @@ build: clear
 
 test: build
 	@echo "Running tests..."
+	rm -rf /tmp/oopsie
+	mkdir -p /tmp/oopsie
 	cd build && ctest --output-on-failure
 	@echo "Tests done"
 

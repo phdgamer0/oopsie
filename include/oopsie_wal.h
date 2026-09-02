@@ -4,9 +4,10 @@
 #define RECORD_MAGIC (uint32_t)0xDEADFACE
 #define DEFAULT_MAP_SIZE (size_t)0x00100000
 typedef enum : uint8_t {
-   OopAction_CREATE = 0x00,
-   OopAction_MODIFY = 0x01,
-   OopAction_DELETE = 0x02,
+   OopAction_CREATE = 0x01,
+   OopAction_MODIFY = 0x02,
+   OopAction_DELETE = 0x03,
+   OopAction_RENAME = 0x04,
 } OopAction_t;
 
 typedef enum : uint8_t {

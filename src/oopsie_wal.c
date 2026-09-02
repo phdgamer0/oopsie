@@ -12,7 +12,12 @@ bool WalFile_IsOpen(const OopWalContext* __restrict WalFile) {
 }
 bool WalFile_Open(OopWalContext* __restrict WalFile, const char* __restrict Path, WalFileFlags_t Flags) {
    WalFile->map_size = DEFAULT_MAP_SIZE;
-   int fd = open(Path, (Flags & WF_CREATE ? O_CREAT : (Flags & WF_TRUNCATE ? O_TRUNC : 0)) | O_RDWR | O_CLOEXEC, 0600);
+   int open_flags = O_RDWR | O_CLOEXEC;
+   if (Flags & WF_CREATE)
+      open_flags |= O_CREAT;
+   if (Flags & WF_TRUNCATE)
+      open_flags |= O_TRUNC;
+   int fd = open(Path, open_flags, 0600);
    if (fd < 0) {
       return (bool)false;
    }
