@@ -22,8 +22,13 @@ int main(void) {
     for (int i = 0; i < NUM_FILES; i++) {
         sprintf(names[i], "/tmp/shim_speed_%d.txt", i);
         sprintf(names2[i], "/tmp/shim_speed_renamed_%d.txt", i);
+#ifdef SYS_unlink
         syscall(SYS_unlink, names[i]);
         syscall(SYS_unlink, names2[i]);
+#else
+        syscall(SYS_unlinkat, AT_FDCWD, names[i], 0);
+        syscall(SYS_unlinkat, AT_FDCWD, names2[i], 0);
+#endif
     }
 
     // Benchmark 1: CREATE
