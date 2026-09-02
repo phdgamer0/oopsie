@@ -8,12 +8,12 @@ enable_testing()
 # Build the WAL Engine as a static library
 add_library(oopsie_wal STATIC src/oopsie_wal.c)
 target_include_directories(oopsie_wal PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_options(oopsie_wal PRIVATE -O3 -Wall -Wextra -pedantic -std=c23)
+target_compile_options(oopsie_wal PRIVATE -O3 -Wall -Wextra -pedantic -std=c2x)
 
 # Main CLI Application
 add_executable(Oopsie src/main.c)
 target_link_libraries(Oopsie PRIVATE oopsie_wal ${CMAKE_DL_LIBS})
-target_compile_options(Oopsie PRIVATE -O3 -Wall -Wextra -pedantic -std=c23 -flto)
+target_compile_options(Oopsie PRIVATE -O3 -Wall -Wextra -pedantic -std=c2x -flto)
 
 # Tests
 add_executable(test_wal_basic tests/test_wal_basic.c)
