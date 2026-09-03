@@ -28,8 +28,29 @@ add_executable(test_wal_speed tests/test_wal_speed.c)
 target_link_libraries(test_wal_speed PRIVATE oopsie_wal)
 add_test(NAME test_wal_speed COMMAND test_wal_speed)
 
+include(ExternalProject)
+
+# Fetch and build liburing from source
+ExternalProject_Add(liburing_ext
+    GIT_REPOSITORY https://github.com/axboe/liburing.git
+    GIT_TAG liburing-2.5
+    CONFIGURE_COMMAND <SOURCE_DIR>/configure
+    BUILD_COMMAND make -C <SOURCE_DIR>/src
+    INSTALL_COMMAND ""
+    BUILD_IN_SOURCE 1
+    BUILD_BYPRODUCTS <SOURCE_DIR>/src/liburing.a
+)
+ExternalProject_Get_Property(liburing_ext SOURCE_DIR)
+file(MAKE_DIRECTORY ${SOURCE_DIR}/src/include) # Prevent CMake error before it builds
+add_library(uring STATIC IMPORTED)
+add_dependencies(uring liburing_ext)
+set_target_properties(uring PROPERTIES
+    IMPORTED_LOCATION ${SOURCE_DIR}/src/liburing.a
+    INTERFACE_INCLUDE_DIRECTORIES ${SOURCE_DIR}/src/include
+)
+
 add_library(oopsie_shim SHARED src/shim.c)
-target_link_libraries(oopsie_shim PRIVATE oopsie_wal ${CMAKE_DL_LIBS})
+target_link_libraries(oopsie_shim PRIVATE oopsie_wal uring ${CMAKE_DL_LIBS})
 
 # Shim Tests
 add_executable(test_shim_basic tests/test_shim_basic.c)

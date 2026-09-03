@@ -1,6 +1,8 @@
+#include <liburing/io_uring.h>
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <liburing.h>
 #include <linux/fs.h>
 #include <oopsie_wal.h>
 #include <stdarg.h>
@@ -14,31 +16,49 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VAULT_PATH (const char*)"/tmp/oopsie/vault_"
+#define VAULT_PATH (const char*)"/tmp/oopsie/000"
+#define VAULT_PATH_LEN (size_t)16
 #define WAL_PATH (const char*)"/tmp/oopsie/vault.wal"
-#define BUFFER_SZ (size_t)512
+#define BUFFER_SZ (size_t)64
 
 OopWalContext GlobalWal;
+struct io_uring ring;
 
 __attribute__((constructor)) void oopsie_init() {
-   WalFile_Open(&GlobalWal, WAL_PATH, WF_CREATE | WF_TRUNCATE);
+   WalFile_Open(&GlobalWal, WAL_PATH, WF_CREATE);
+   io_uring_queue_init((unsigned int)1024, &ring, (unsigned int)0);
+   char paths[VAULT_PATH_LEN];
+   memcpy(paths, VAULT_PATH, VAULT_PATH_LEN);
+   uint16_t i = 0;
+   while (i < (uint16_t)256) { // hoping the almighty compiler parallelize this loop
+      paths[VAULT_PATH_LEN - 2] = (char)((i % (uint16_t)10) + '0');
+      paths[VAULT_PATH_LEN - 3] = (char)(((i / (uint16_t)10) % (uint16_t)10) + '0');
+      paths[VAULT_PATH_LEN - 4] = (char)(i / (uint16_t)100 + '0');
+      (void)mkdir(paths, 0700);
+      i++;
+   }
 }
 __attribute__((destructor)) void oopsie_cleanup() {
+   io_uring_queue_exit(&ring);
    WalFile_Close(&GlobalWal);
 }
 
 static inline void make_vault_path(char* buffer, unsigned long ino) {
-    char temp[32];
-    char* p = temp + 31;
-    *p = '\0';
-    do {
-        *--p = '0' + (ino % 10);
-        ino /= 10;
-    } while (ino > 0);
-    
-    memcpy(buffer, "/tmp/oopsie/vault_", 18);
-    size_t len = (temp + 31) - p + 1;
-    memcpy(buffer + 18, p, len);
+   char temp[48];
+   memcpy(buffer, "/tmp/oopsie/000/vault_", 22);
+   uint8_t i = (uint8_t)(ino & UINT8_MAX);
+   buffer[VAULT_PATH_LEN - 2] = (char)((i % (uint8_t)10) + (char)'0');
+   buffer[VAULT_PATH_LEN - 3] = (char)(((i / (uint8_t)10) % (uint8_t)10) + (char)'0');
+   buffer[VAULT_PATH_LEN - 4] = (char)(i / (uint8_t)100 + (char)'0');
+   char* p = temp + 47;
+   *p = '\0';
+   do {
+      *--p = '0' + (ino % 10);
+      ino /= 10;
+   } while (ino > 0);
+
+   size_t len = (temp + 47) - p + 1;
+   memcpy(buffer + 22, p, len);
 }
 
 typedef int(gnu_unlink_t)(const char* path);
@@ -67,6 +87,9 @@ int unlink(const char* path) {
    if (gnu_openat == NULL) {
       gnu_openat = (gnu_openat_t*)dlsym(RTLD_NEXT, "openat");
    }
+   if (strncmp(path, "/tmp/oopsie/", 12) == 0) {
+      return gnu_unlink(path);
+   }
    OopWalRecord rec;
    struct stat stat_buf;
    if (lstat(path, &stat_buf) == 0 && S_ISREG(stat_buf.st_mode)) {
@@ -75,27 +98,35 @@ int unlink(const char* path) {
       rec.timestamp = (uint64_t)time(NULL);
       rec.action = OopAction_DELETE;
       rec.pathlen = (uint32_t)strlen(path);
+      rec.inode = (uint64_t)stat_buf.st_ino;
       WalFile_Append(&GlobalWal, path, &rec);
-      int cloneRes = -1;
-      int srcFd = gnu_open(path, O_RDONLY | O_CLOEXEC, 0600);
-      if (srcFd < 0) {
-         return gnu_unlink(path);
-      }
-      char buffer[64];
+      char buffer[BUFFER_SZ];
       make_vault_path(buffer, stat_buf.st_ino);
-      int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
-      if (destFd < 0) {
-         close(srcFd);
+      struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+      io_uring_prep_link(sqe, path, buffer, 0);
+      io_uring_submit(&ring);
+      struct io_uring_cqe* cqe = NULL;
+      io_uring_wait_cqe(&ring, &cqe);
+      int link_res = cqe->res;
+      io_uring_cqe_seen(&ring, cqe);
+      if (link_res == 0) {
          return gnu_unlink(path);
       }
+      int srcFd = gnu_open(path, O_RDONLY | O_CLOEXEC, 0600);
+      if (srcFd < 0)
+         return gnu_unlink(path);
+      int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+      if (destFd >= 0) {
+         int cloneRes = -1;
 #ifdef FICLONE
-      cloneRes = ioctl(destFd, FICLONE, srcFd);
+         cloneRes = ioctl(destFd, FICLONE, srcFd);
 #endif
-      if (cloneRes != 0) {
-         sendfile(destFd, srcFd, NULL, stat_buf.st_size);
+         if (cloneRes != 0) {
+            sendfile(destFd, srcFd, NULL, stat_buf.st_size);
+         }
+         close(destFd);
       }
       close(srcFd);
-      close(destFd);
    }
    return gnu_unlink(path);
 }
@@ -110,6 +141,9 @@ int unlinkat(int dirfd, const char* path, int flags) {
    if (gnu_openat == NULL) {
       gnu_openat = (gnu_openat_t*)dlsym(RTLD_NEXT, "openat");
    }
+   if (strncmp(path, "/tmp/oopsie/", 12) == 0) {
+      return gnu_unlinkat(dirfd, path, flags);
+   }
    OopWalRecord rec;
    struct stat stat_buf;
    if (fstatat(dirfd, path, &stat_buf, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(stat_buf.st_mode)) {
@@ -118,18 +152,29 @@ int unlinkat(int dirfd, const char* path, int flags) {
       rec.timestamp = (uint64_t)time(NULL);
       rec.action = OopAction_DELETE;
       rec.pathlen = (uint32_t)strlen(path);
+      rec.inode = (uint64_t)stat_buf.st_ino;
       WalFile_Append(&GlobalWal, path, &rec);
+      char buffer[BUFFER_SZ];
+      make_vault_path(buffer, stat_buf.st_ino);
+      struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+      io_uring_prep_linkat(sqe, dirfd, path, AT_FDCWD, buffer, (int)0);
+      io_uring_submit(&ring);
+      struct io_uring_cqe* cqe = NULL;
+      io_uring_wait_cqe(&ring, &cqe);
+      int link_res = cqe->res;
+      io_uring_cqe_seen(&ring, cqe);
+      if (link_res == 0) {
+         return gnu_unlinkat(dirfd, path, flags);
+      }
       int cloneRes = (int)-1;
       int srcFd = gnu_openat(dirfd, path, O_RDONLY | O_CLOEXEC, 0600);
       if (srcFd < 0) {
-         return gnu_unlink(path);
+         return gnu_unlinkat(dirfd, path, flags);
       }
-      char buffer[64];
-      make_vault_path(buffer, stat_buf.st_ino);
       int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
       if (destFd < (int)0) {
          close(srcFd);
-         return gnu_unlink(path);
+         return gnu_unlinkat(dirfd, path, flags);
       }
 #ifdef FICLONE
       cloneRes = ioctl(destFd, FICLONE, srcFd);
@@ -166,18 +211,14 @@ int open(const char* pathname, int flags, ...) {
       rec.filesize = (uint64_t)stat_.st_size;
       rec.timestamp = (uint64_t)time(NULL);
       rec.pathlen = (uint32_t)strlen(pathname);
+      rec.inode = (uint64_t)stat_.st_ino;
       WalFile_Append(&GlobalWal, pathname, &rec);
+      char buffer[BUFFER_SZ];
+      make_vault_path(buffer, stat_.st_ino);
       int srcFd = gnu_open(pathname, O_RDONLY | O_CLOEXEC, 0600);
       if (srcFd < (int)0) {
          return gnu_open(pathname, flags, mode);
       }
-      char buffer[BUFFER_SZ];
-      int filled = snprintf(buffer, BUFFER_SZ, "%s%lu", VAULT_PATH, stat_.st_ino);
-      if (filled >= BUFFER_SZ) {
-         close(srcFd);
-         return gnu_open(pathname, flags, mode);
-      }
-      buffer[filled] = '\0';
       int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
       if (destFd < (int)0) {
          close(srcFd);
@@ -228,18 +269,14 @@ int openat(int dirfd, const char* pathname, int flags, ...) {
       rec.filesize = (uint64_t)stat_.st_size;
       rec.timestamp = (uint64_t)time(NULL);
       rec.pathlen = (uint32_t)strlen(pathname);
+      rec.inode = (uint64_t)stat_.st_ino;
       WalFile_Append(&GlobalWal, pathname, &rec);
       int srcFd = gnu_openat(dirfd, pathname, O_RDONLY | O_CLOEXEC, 0600);
       if (srcFd < (int)0) {
          return gnu_openat(dirfd, pathname, flags, mode);
       }
       char buffer[BUFFER_SZ];
-      int filled = snprintf(buffer, BUFFER_SZ, "%s%lu", VAULT_PATH, stat_.st_ino);
-      if (filled >= BUFFER_SZ) {
-         close(srcFd);
-         return gnu_openat(dirfd, pathname, flags, mode);
-      }
-      buffer[filled] = '\0';
+      make_vault_path(buffer, stat_.st_ino);
       int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
       if (destFd < (int)0) {
          close(srcFd);
@@ -265,6 +302,7 @@ int openat(int dirfd, const char* pathname, int flags, ...) {
    }
    return gnu_openat(dirfd, pathname, flags, mode);
 }
+
 int rename(const char* oldpath, const char* newpath) {
    if (gnu_rename == NULL) {
       gnu_rename = (gnu_rename_t*)dlsym(RTLD_NEXT, "rename");
@@ -283,12 +321,20 @@ int rename(const char* oldpath, const char* newpath) {
       rec_new.timestamp = (uint64_t)time(NULL);
       rec_new.action = OopAction_DELETE;
       rec_new.pathlen = (uint32_t)strlen(newpath);
+      rec_new.inode = (uint64_t)stat_buf.st_ino;
       WalFile_Append(&GlobalWal, newpath, &rec_new);
-      int srcFd = gnu_open(newpath, O_RDONLY | O_CLOEXEC, 0600);
-      if (srcFd >= 0) {
-         char buffer[64];
-         make_vault_path(buffer, stat_buf.st_ino);
-         if (1) {
+      char buffer[BUFFER_SZ];
+      make_vault_path(buffer, stat_buf.st_ino);
+      struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+      io_uring_prep_link(sqe, newpath, buffer, 0);
+      io_uring_submit(&ring);
+      struct io_uring_cqe* cqe = NULL;
+      io_uring_wait_cqe(&ring, &cqe);
+      int link_res = cqe->res;
+      io_uring_cqe_seen(&ring, cqe);
+      if (link_res < 0) {
+         int srcFd = gnu_open(newpath, O_RDONLY | O_CLOEXEC, 0600);
+         if (srcFd >= 0) {
             int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
             if (destFd >= 0) {
                int cloneRes = -1;
@@ -300,8 +346,8 @@ int rename(const char* oldpath, const char* newpath) {
                }
                close(destFd);
             }
+            close(srcFd);
          }
-         close(srcFd);
       }
    }
    OopWalRecord rec_rename;
@@ -309,6 +355,7 @@ int rename(const char* oldpath, const char* newpath) {
    rec_rename.action = OopAction_RENAME;
    rec_rename.filesize = 0;
    rec_rename.timestamp = (uint64_t)time(NULL);
+   rec_rename.inode = (uint64_t)stat_buf.st_ino;
    size_t old_len = strlen(oldpath);
    size_t new_len = strlen(newpath);
    rec_rename.pathlen = (uint32_t)(old_len + 1 + new_len + 1);
@@ -342,25 +389,35 @@ int renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpat
       rec_new.timestamp = (uint64_t)time(NULL);
       rec_new.action = OopAction_DELETE;
       rec_new.pathlen = (uint32_t)strlen(newpath);
+      rec_new.inode = (uint64_t)stat_buf.st_ino;
       WalFile_Append(&GlobalWal, newpath, &rec_new);
-      int srcFd = gnu_openat(newdirfd, newpath, O_RDONLY | O_CLOEXEC, 0600);
-      if (srcFd >= 0) {
-         char buffer[64];
-         make_vault_path(buffer, stat_buf.st_ino);
-         if (1) {
-            int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
-            if (destFd >= 0) {
-               int cloneRes = -1;
+      char buffer[BUFFER_SZ];
+      make_vault_path(buffer, stat_buf.st_ino);
+      struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+      io_uring_prep_linkat(sqe, newdirfd, newpath, AT_FDCWD, buffer, (int)0);
+      io_uring_submit(&ring);
+      struct io_uring_cqe* cqe = NULL;
+      io_uring_wait_cqe(&ring, &cqe);
+      int link_res = cqe->res;
+      io_uring_cqe_seen(&ring, cqe);
+      if (link_res < (int)0) {
+         int srcFd = gnu_openat(newdirfd, newpath, O_RDONLY | O_CLOEXEC, 0600);
+         if (srcFd >= 0) {
+            if (1) {
+               int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+               if (destFd >= 0) {
+                  int cloneRes = -1;
 #ifdef FICLONE
-               cloneRes = ioctl(destFd, FICLONE, srcFd);
+                  cloneRes = ioctl(destFd, FICLONE, srcFd);
 #endif
-               if (cloneRes != 0) {
-                  sendfile(destFd, srcFd, NULL, stat_buf.st_size);
+                  if (cloneRes != 0) {
+                     sendfile(destFd, srcFd, NULL, stat_buf.st_size);
+                  }
+                  close(destFd);
                }
-               close(destFd);
             }
+            close(srcFd);
          }
-         close(srcFd);
       }
    }
    OopWalRecord rec_rename;
@@ -371,6 +428,7 @@ int renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpat
    size_t old_len = strlen(oldpath);
    size_t new_len = strlen(newpath);
    rec_rename.pathlen = (uint32_t)(old_len + 1 + new_len + 1);
+   rec_rename.inode = (uint64_t)stat_buf.st_ino;
    char packed[4096];
    if (rec_rename.pathlen <= 4096) {
       memcpy(packed, oldpath, old_len + 1);
@@ -402,24 +460,33 @@ int renameat2(int olddirfd, const char* oldpath, int newdirfd, const char* newpa
       rec_new.action = OopAction_DELETE;
       rec_new.pathlen = (uint32_t)strlen(newpath);
       WalFile_Append(&GlobalWal, newpath, &rec_new);
-      int srcFd = gnu_openat(newdirfd, newpath, O_RDONLY | O_CLOEXEC, 0600);
-      if (srcFd >= 0) {
-         char buffer[64];
-         make_vault_path(buffer, stat_buf.st_ino);
-         if (1) {
-            int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
-            if (destFd >= 0) {
-               int cloneRes = -1;
+      char buffer[BUFFER_SZ];
+      make_vault_path(buffer, stat_buf.st_ino);
+      struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+      io_uring_prep_linkat(sqe, newdirfd, newpath, AT_FDCWD, buffer, (int)0);
+      io_uring_submit(&ring);
+      struct io_uring_cqe* cqe = NULL;
+      io_uring_wait_cqe(&ring, &cqe);
+      int link_res = cqe->res;
+      io_uring_cqe_seen(&ring, cqe);
+      if (link_res < (int)0) {
+         int srcFd = gnu_openat(newdirfd, newpath, O_RDONLY | O_CLOEXEC, 0600);
+         if (srcFd >= 0) {
+            if (1) {
+               int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+               if (destFd >= 0) {
+                  int cloneRes = -1;
 #ifdef FICLONE
-               cloneRes = ioctl(destFd, FICLONE, srcFd);
+                  cloneRes = ioctl(destFd, FICLONE, srcFd);
 #endif
-               if (cloneRes != 0) {
-                  sendfile(destFd, srcFd, NULL, stat_buf.st_size);
+                  if (cloneRes != 0) {
+                     sendfile(destFd, srcFd, NULL, stat_buf.st_size);
+                  }
+                  close(destFd);
                }
-               close(destFd);
             }
+            close(srcFd);
          }
-         close(srcFd);
       }
    }
    OopWalRecord rec_rename;

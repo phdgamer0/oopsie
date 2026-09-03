@@ -40,8 +40,9 @@ int main() {
     }
     
     int found_create = 0;
-    size_t cursor = 0;
-    while (cursor < wal.offset) {
+    WalHeader* header = (WalHeader*)wal.map;
+    size_t cursor = sizeof(WalHeader);
+    while (cursor < header->current_offset) {
         OopWalRecord* rec_ptr = (OopWalRecord*)((char*)wal.map + cursor);
         if (rec_ptr->magic != RECORD_MAGIC) break;
         
@@ -69,8 +70,8 @@ int main() {
     
     // Verify WAL has MODIFY
     int found_modify = 0;
-    cursor = 0;
-    while (cursor < wal.offset) {
+    cursor = sizeof(WalHeader);
+    while (cursor < header->current_offset) {
         OopWalRecord* rec_ptr = (OopWalRecord*)((char*)wal.map + cursor);
         if (rec_ptr->magic != RECORD_MAGIC) break;
         

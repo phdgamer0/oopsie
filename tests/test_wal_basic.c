@@ -36,7 +36,7 @@ int main(void) {
     };
     WalFile_Append(&wal, path2, &rec2);
 
-    size_t cursor = wal.offset;
+    size_t cursor = 0;
     OopWalRecord outRec;
     char outPath[4096];
 

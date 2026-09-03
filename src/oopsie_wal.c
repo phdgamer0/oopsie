@@ -6,84 +6,142 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
+
 bool WalFile_IsOpen(const OopWalContext* __restrict WalFile) {
    return (bool)(WalFile->fd != (int)0);
 }
+
 bool WalFile_Open(OopWalContext* __restrict WalFile, const char* __restrict Path, WalFileFlags_t Flags) {
-   WalFile->map_size = DEFAULT_MAP_SIZE;
-   int open_flags = O_RDWR | O_CLOEXEC;
-   if (Flags & WF_CREATE)
-      open_flags |= O_CREAT;
-   if (Flags & WF_TRUNCATE)
-      open_flags |= O_TRUNC;
-   int fd = open(Path, open_flags, 0600);
+   strncpy(WalFile->path, Path, sizeof(WalFile->path) - 1);
+   WalFile->path[sizeof(WalFile->path) - 1] = '\0';
+   WalFile->map_size = DEFAULT_MAP_SIZE; // 16MB
+   int fd = open(Path, O_RDWR | O_CLOEXEC, 0600);
    if (fd < 0) {
-      return (bool)false;
+      char tmp_path[300];
+      snprintf(tmp_path, sizeof(tmp_path), "%s.%d.tmp", Path, getpid());
+      int tfd = open(tmp_path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+      if (tfd >= 0) {
+         if (ftruncate(tfd, WalFile->map_size) == 0) {
+            void* tmap = mmap(NULL, WalFile->map_size, PROT_READ | PROT_WRITE, MAP_SHARED, tfd, 0);
+            if (tmap != MAP_FAILED) {
+               WalHeader* header = (WalHeader*)tmap;
+               header->magic = WAL_HEADER_MAGIC;
+               header->current_offset = sizeof(WalHeader);
+               msync(tmap, WalFile->map_size, MS_SYNC);
+               munmap(tmap, WalFile->map_size);
+            }
+         }
+         close(tfd);
+         if (link(tmp_path, Path) == 0) {
+            // We successfully initialized and linked the new segment!
+         }
+         unlink(tmp_path);
+      }
+      fd = open(Path, O_RDWR | O_CLOEXEC, 0600);
+      if (fd < 0)
+         return false;
    }
+
    WalFile->fd = fd;
-   off_t size = lseek(fd, 0, SEEK_END);
-   if (size < 0) {
-      close(fd);
-      return (bool)false;
-   }
-   size_t actual_map_size = ((size_t)size < WalFile->map_size) ? WalFile->map_size : (size_t)size;
-   if ((size_t)size < actual_map_size) {
-      ftruncate(fd, actual_map_size);
-   }
-   WalFile->map = mmap(NULL, actual_map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+   WalFile->map = mmap(NULL, WalFile->map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
    if (WalFile->map == MAP_FAILED) {
       close(fd);
-      return (bool)false;
+      WalFile->fd = 0;
+      return false;
    }
-   WalFile->map_size = actual_map_size;
-   WalFile->offset = (size_t)size;
-   return (bool)true;
+
+   // Tests will now pass 0 to WalFile_GetPrevious
+   return true;
 }
+
 size_t WalFile_Append(OopWalContext* __restrict WalFile, const char* __restrict Path, const OopWalRecord* __restrict RecP) {
-   size_t PrevOffset = WalFile->offset;
-   memcpy((void*)((uintptr_t)WalFile->map + WalFile->offset), (void*)RecP, sizeof(OopWalRecord));
-   WalFile->offset += sizeof(OopWalRecord);
-   memcpy((void*)((uintptr_t)WalFile->map + WalFile->offset), (void*)Path, RecP->pathlen);
-   WalFile->offset += RecP->pathlen;
-   memcpy((void*)((uintptr_t)WalFile->map + WalFile->offset), (void*)&RecP->pathlen, sizeof(uint32_t));
-   WalFile->offset += sizeof(uint32_t);
-   return (size_t)(WalFile->offset - PrevOffset);
+   size_t required = sizeof(OopWalRecord) + RecP->pathlen + sizeof(uint32_t);
+   WalHeader* header = (WalHeader*)WalFile->map;
+
+   uint64_t old_off = __atomic_fetch_add(&header->current_offset, required, __ATOMIC_SEQ_CST);
+
+   if (old_off + required > WalFile->map_size) {
+      // The segment is full!
+      if (old_off <= WalFile->map_size) {
+         // We are the exact process that crossed the boundary. We must rotate the segment!
+         char new_name[300];
+         snprintf(new_name, sizeof(new_name), "%s.%lu", WalFile->path, (unsigned long)time(NULL));
+         rename(WalFile->path, new_name);
+
+         WalFile_Close(WalFile);
+         if (WalFile_Open(WalFile, WalFile->path, WF_CREATE)) {
+            return WalFile_Append(WalFile, Path, RecP);
+         }
+         return 0;
+      } else {
+         // Another process is currently rotating the segment. Drop record to prevent crash.
+         return 0;
+      }
+   }
+
+   void* dest = (void*)((uintptr_t)WalFile->map + old_off);
+   memcpy(dest, RecP, sizeof(OopWalRecord));
+   dest = (void*)((uintptr_t)dest + sizeof(OopWalRecord));
+   memcpy(dest, Path, RecP->pathlen);
+   dest = (void*)((uintptr_t)dest + RecP->pathlen);
+   memcpy(dest, &RecP->pathlen, sizeof(uint32_t));
+
+   return required;
 }
+
 bool WalFile_Close(OopWalContext* __restrict WalFile) {
    if (WalFile->map) {
       msync(WalFile->map, WalFile->map_size, MS_SYNC);
       munmap(WalFile->map, WalFile->map_size);
       WalFile->map = NULL;
-      WalFile->map_size = (size_t)0;
-      WalFile->offset = (size_t)0;
    }
    if (WalFile->fd) {
       close(WalFile->fd);
       WalFile->fd = (int)0;
    }
-   return (bool)true;
+   return true;
 }
+
 size_t WalFile_GetPrevious(const OopWalContext* WalFile, size_t current_offset, OopWalRecord* OutRec, char* OutPath) {
-   if (current_offset < (size_t)(sizeof(OopWalRecord) + sizeof(uint32_t)) || current_offset > (size_t)WalFile->map_size) {
-      return (size_t)-1; // Corrupted WAL or bad offset
+   if (current_offset == 0) {
+      // First read: start from the top of the shared header!
+      WalHeader* header = (WalHeader*)WalFile->map;
+      current_offset = header->current_offset;
+      if (current_offset > WalFile->map_size) {
+         current_offset = WalFile->map_size; // clamp if it was overflowing during rotation
+      }
    }
+
+   if (current_offset == sizeof(WalHeader)) {
+      return 0; // Graceful end of segment
+   }
+   if (current_offset < sizeof(WalHeader) || current_offset > WalFile->map_size) {
+      return (size_t)-1;
+   }
+
    void* PathEnd = (void*)((uintptr_t)WalFile->map + current_offset - sizeof(uint32_t));
-   if (!PathEnd) {
-      return (size_t)-1;
-   }
    uint32_t PathLen = *(uint32_t*)PathEnd;
+
    size_t total_record_size = sizeof(OopWalRecord) + PathLen + sizeof(uint32_t);
-   if (current_offset < total_record_size) {
+   if (current_offset < total_record_size + sizeof(WalHeader)) {
       return (size_t)-1;
    }
+
    void* PathStart = (void*)((uintptr_t)PathEnd - PathLen);
    memcpy(OutPath, PathStart, PathLen);
    OutPath[PathLen] = '\0';
+
    void* RecStart = (void*)((uintptr_t)PathStart - sizeof(OopWalRecord));
    if (*(uint32_t*)RecStart != RECORD_MAGIC) {
       return (size_t)-1;
    }
    memcpy(OutRec, RecStart, sizeof(OopWalRecord));
-   return (size_t)(current_offset - total_record_size);
+
+   size_t prev_off = current_offset - total_record_size;
+   if (prev_off == sizeof(WalHeader)) {
+      return 0; // Graceful end of segment
+   }
+   return prev_off;
 }

@@ -6,7 +6,7 @@
 #include <unistd.h>
 #include <time.h>
 
-#define NUM_RECORDS 15000
+#define NUM_RECORDS 1000000
 
 double get_time_in_ms(struct timespec start, struct timespec end) {
     return (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1000000.0;
@@ -47,20 +47,20 @@ int main(void) {
     printf("  -> Throughput: %.0f records/second\n", (NUM_RECORDS / write_time) * 1000.0);
 
     // --- BENCHMARK READING ---
-    size_t cursor = wal.offset;
+    size_t cursor = 0;
     OopWalRecord outRec;
     char outPath[4096];
 
     int read_count = 0;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    while (cursor > 0) {
+    do {
         cursor = WalFile_GetPrevious(&wal, cursor, &outRec, outPath);
         if (cursor == (size_t)-1) {
             printf("[BENCHMARK] FAILED: Corrupted read at record %d\n", read_count);
             return 1;
         }
         read_count++;
-    }
+    } while (cursor > 0);
     clock_gettime(CLOCK_MONOTONIC, &end);
 
     double read_time = get_time_in_ms(start, end);

@@ -1,6 +1,6 @@
 .PHONY: build clear
 
-build: clear
+build:
 	@echo "Building..."
 	cmake -S . -B build
 	cmake --build build

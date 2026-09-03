@@ -1,7 +1,7 @@
 build
 build/Oopsie
 .cache/
-.agent/*
+.agent
 *.exe
 *.o
 *.so

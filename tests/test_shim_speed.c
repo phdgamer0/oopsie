@@ -3,18 +3,19 @@
 #include <fcntl.h>
 #include <time.h>
 #include <sys/syscall.h>
+#include <stdlib.h>
 
-#define NUM_FILES 1000
+#define NUM_FILES 100000
 
-double get_time_ms(struct timespec start, struct timespec end) {
+static double get_time_ms(struct timespec start, struct timespec end) {
     return (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1000000.0;
 }
 
 int main(void) {
     printf("[TEST] Starting Shim Speed Test (%d files)...\n", NUM_FILES);
 
-    char names[NUM_FILES][256];
-    char names2[NUM_FILES][256];
+    char (*names)[256] = malloc(NUM_FILES * 256);
+    char (*names2)[256] = malloc(NUM_FILES * 256);
     struct timespec start, end;
     double elapsed;
 
