@@ -10,9 +10,29 @@ add_library(oopsie_wal STATIC src/oopsie_wal.c)
 target_include_directories(oopsie_wal PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(oopsie_wal PRIVATE -O3 -Wall -Wextra -pedantic -std=c2x)
 
+include(FetchContent)
+
+# TUI dependency
+FetchContent_Declare(
+    termbox2
+    URL https://raw.githubusercontent.com/termbox/termbox2/master/termbox2.h
+    DOWNLOAD_NO_EXTRACT TRUE
+)
+FetchContent_MakeAvailable(termbox2)
+
+set(TERMBOX2_INCLUDE_DIR "${CMAKE_BINARY_DIR}/external/termbox2")
+file(MAKE_DIRECTORY "${TERMBOX2_INCLUDE_DIR}")
+file(COPY "${termbox2_SOURCE_DIR}/termbox2.h" DESTINATION "${TERMBOX2_INCLUDE_DIR}")
+
+add_library(oopsie_graphics STATIC src/oopsie_graphics.c)
+target_include_directories(oopsie_graphics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(oopsie_graphics PRIVATE ${termbox2_SOURCE_DIR})
+target_compile_options(oopsie_graphics PRIVATE -O3 -Wall -Wextra -std=c2x)
+
 # Main CLI Application
 add_executable(Oopsie src/main.c)
 target_link_libraries(Oopsie PRIVATE oopsie_wal ${CMAKE_DL_LIBS})
+target_link_libraries(Oopsie PRIVATE oopsie_graphics ${CMAKE_DL_LIBS})
 target_compile_options(Oopsie PRIVATE -O3 -Wall -Wextra -pedantic -std=c2x -flto)
 
 # Tests

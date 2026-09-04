@@ -1,3 +1,5 @@
+#pragma once
+
 #ifndef OOPSIE_WAL_H
 #define OOPSIE_WAL_H
 
