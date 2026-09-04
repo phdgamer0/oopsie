@@ -1,8 +1,8 @@
-#include <liburing/io_uring.h>
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <liburing.h>
+#include <liburing/io_uring.h>
 #include <linux/fs.h>
 #include <oopsie_wal.h>
 #include <stdarg.h>
@@ -25,8 +25,12 @@ OopWalContext GlobalWal;
 struct io_uring ring;
 
 __attribute__((constructor)) void oopsie_init() {
-   WalFile_Open(&GlobalWal, WAL_PATH, WF_CREATE);
-   io_uring_queue_init((unsigned int)1024, &ring, (unsigned int)0);
+   WalFile_Open(&GlobalWal, WAL_PATH);
+   struct io_uring_params params;
+   memset((void*)&params, (int)0, sizeof(params));
+   params.flags = IORING_SETUP_SQPOLL;
+   params.sq_thread_idle = (unsigned int)2000;
+   io_uring_queue_init_params((unsigned int)1024, &ring, &params);
    char paths[VAULT_PATH_LEN];
    memcpy(paths, VAULT_PATH, VAULT_PATH_LEN);
    uint16_t i = 0;
@@ -104,13 +108,24 @@ int unlink(const char* path) {
       make_vault_path(buffer, stat_buf.st_ino);
       struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
       io_uring_prep_link(sqe, path, buffer, 0);
+      sqe->flags |= IOSQE_IO_LINK;
+      struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
+      io_uring_prep_unlink(sqe2, path, 0);
       io_uring_submit(&ring);
       struct io_uring_cqe* cqe = NULL;
-      io_uring_wait_cqe(&ring, &cqe);
+      struct io_uring_cqe* cqe2 = NULL;
+      while (io_uring_peek_cqe(&ring, &cqe) != (int)0) {
+         __builtin_ia32_pause();
+      }
       int link_res = cqe->res;
       io_uring_cqe_seen(&ring, cqe);
-      if (link_res == 0) {
-         return gnu_unlink(path);
+      while (io_uring_peek_cqe(&ring, &cqe2) != (int)0) {
+         __builtin_ia32_pause();
+      }
+      int unlink_res = cqe2->res;
+      io_uring_cqe_seen(&ring, cqe2);
+      if (link_res >= (int)0) {
+         return (unlink_res >= (int)0) ? (int)0 : (int)-1;
       }
       int srcFd = gnu_open(path, O_RDONLY | O_CLOEXEC, 0600);
       if (srcFd < 0)
@@ -158,13 +173,24 @@ int unlinkat(int dirfd, const char* path, int flags) {
       make_vault_path(buffer, stat_buf.st_ino);
       struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
       io_uring_prep_linkat(sqe, dirfd, path, AT_FDCWD, buffer, (int)0);
+      sqe->flags |= IOSQE_IO_LINK;
+      struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
+      io_uring_prep_unlinkat(sqe2, dirfd, path, flags);
       io_uring_submit(&ring);
       struct io_uring_cqe* cqe = NULL;
-      io_uring_wait_cqe(&ring, &cqe);
+      struct io_uring_cqe* cqe2 = NULL;
+      while (io_uring_peek_cqe(&ring, &cqe) != 0) {
+         __builtin_ia32_pause();
+      }
       int link_res = cqe->res;
       io_uring_cqe_seen(&ring, cqe);
-      if (link_res == 0) {
-         return gnu_unlinkat(dirfd, path, flags);
+      while (io_uring_peek_cqe(&ring, &cqe2) != 0) {
+         __builtin_ia32_pause();
+      }
+      int unlink_res = cqe2->res;
+      io_uring_cqe_seen(&ring, cqe2);
+      if (link_res >= (int)0) {
+         return (unlink_res >= (int)0) ? (int)0 : (int)-1;
       }
       int cloneRes = (int)-1;
       int srcFd = gnu_openat(dirfd, path, O_RDONLY | O_CLOEXEC, 0600);
@@ -215,13 +241,35 @@ int open(const char* pathname, int flags, ...) {
       WalFile_Append(&GlobalWal, pathname, &rec);
       char buffer[BUFFER_SZ];
       make_vault_path(buffer, stat_.st_ino);
-      int srcFd = gnu_open(pathname, O_RDONLY | O_CLOEXEC, 0600);
+      struct io_uring_sqe* sqe_src = io_uring_get_sqe(&ring);
+      io_uring_prep_openat(sqe_src, AT_FDCWD, pathname, O_RDONLY | O_CLOEXEC, 0600);
+      struct io_uring_sqe* sqe_dest = io_uring_get_sqe(&ring);
+      io_uring_prep_openat(sqe_dest, AT_FDCWD, buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+      io_uring_submit(&ring);
+      struct io_uring_cqe* cqe_src = NULL;
+      struct io_uring_cqe* cqe_dest = NULL;
+      while (io_uring_peek_cqe(&ring, &cqe_src) != 0) {
+         __builtin_ia32_pause();
+      }
+      int srcFd = cqe_src->res;
+      io_uring_cqe_seen(&ring, cqe_src);
+      while (io_uring_peek_cqe(&ring, &cqe_dest) != 0) {
+         __builtin_ia32_pause();
+      }
+      int destFd = cqe_dest->res;
+      io_uring_cqe_seen(&ring, cqe_dest);
       if (srcFd < (int)0) {
          return gnu_open(pathname, flags, mode);
       }
-      int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
       if (destFd < (int)0) {
-         close(srcFd);
+         struct io_uring_sqe* sqe_c = io_uring_get_sqe(&ring);
+         io_uring_prep_close(sqe_c, srcFd);
+         io_uring_submit(&ring);
+         struct io_uring_cqe* cqe_c = NULL;
+         while (io_uring_peek_cqe(&ring, &cqe_c) != 0) {
+            __builtin_ia32_pause();
+         }
+         io_uring_cqe_seen(&ring, cqe_c);
          return gnu_open(pathname, flags, mode);
       }
       int cloneRes = (int)-1;
@@ -231,8 +279,21 @@ int open(const char* pathname, int flags, ...) {
       if (cloneRes != (int)0) {
          sendfile(destFd, srcFd, NULL, stat_.st_size);
       }
-      close(srcFd);
-      close(destFd);
+      struct io_uring_sqe* sqe_c1 = io_uring_get_sqe(&ring);
+      io_uring_prep_close(sqe_c1, srcFd);
+      struct io_uring_sqe* sqe_c2 = io_uring_get_sqe(&ring);
+      io_uring_prep_close(sqe_c2, destFd);
+      io_uring_submit(&ring);
+      struct io_uring_cqe* cqe_c1 = NULL;
+      struct io_uring_cqe* cqe_c2 = NULL;
+      while (io_uring_peek_cqe(&ring, &cqe_c1) != 0) {
+         __builtin_ia32_pause();
+      }
+      io_uring_cqe_seen(&ring, cqe_c1);
+      while (io_uring_peek_cqe(&ring, &cqe_c2) != 0) {
+         __builtin_ia32_pause();
+      }
+      io_uring_cqe_seen(&ring, cqe_c2);
    } else if (!exists && (flags & O_CREAT)) {
       OopWalRecord rec;
       rec.magic = RECORD_MAGIC;
@@ -271,15 +332,37 @@ int openat(int dirfd, const char* pathname, int flags, ...) {
       rec.pathlen = (uint32_t)strlen(pathname);
       rec.inode = (uint64_t)stat_.st_ino;
       WalFile_Append(&GlobalWal, pathname, &rec);
-      int srcFd = gnu_openat(dirfd, pathname, O_RDONLY | O_CLOEXEC, 0600);
+      char buffer[BUFFER_SZ];
+      make_vault_path(buffer, stat_.st_ino);
+      struct io_uring_sqe* sqe_src = io_uring_get_sqe(&ring);
+      io_uring_prep_openat(sqe_src, dirfd, pathname, O_RDONLY | O_CLOEXEC, 0600);
+      struct io_uring_sqe* sqe_dest = io_uring_get_sqe(&ring);
+      io_uring_prep_openat(sqe_dest, AT_FDCWD, buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+      io_uring_submit(&ring);
+      struct io_uring_cqe* cqe_src = NULL;
+      struct io_uring_cqe* cqe_dest = NULL;
+      while (io_uring_peek_cqe(&ring, &cqe_src) != 0) {
+         __builtin_ia32_pause();
+      }
+      int srcFd = cqe_src->res;
+      io_uring_cqe_seen(&ring, cqe_src);
+      while (io_uring_peek_cqe(&ring, &cqe_dest) != 0) {
+         __builtin_ia32_pause();
+      }
+      int destFd = cqe_dest->res;
+      io_uring_cqe_seen(&ring, cqe_dest);
       if (srcFd < (int)0) {
          return gnu_openat(dirfd, pathname, flags, mode);
       }
-      char buffer[BUFFER_SZ];
-      make_vault_path(buffer, stat_.st_ino);
-      int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
       if (destFd < (int)0) {
-         close(srcFd);
+         struct io_uring_sqe* sqe_c = io_uring_get_sqe(&ring);
+         io_uring_prep_close(sqe_c, srcFd);
+         io_uring_submit(&ring);
+         struct io_uring_cqe* cqe_c = NULL;
+         while (io_uring_peek_cqe(&ring, &cqe_c) != 0) {
+            __builtin_ia32_pause();
+         }
+         io_uring_cqe_seen(&ring, cqe_c);
          return gnu_openat(dirfd, pathname, flags, mode);
       }
       int cloneRes = (int)-1;
@@ -289,8 +372,21 @@ int openat(int dirfd, const char* pathname, int flags, ...) {
       if (cloneRes != (int)0) {
          sendfile(destFd, srcFd, NULL, stat_.st_size);
       }
-      close(srcFd);
-      close(destFd);
+      struct io_uring_sqe* sqe_c1 = io_uring_get_sqe(&ring);
+      io_uring_prep_close(sqe_c1, srcFd);
+      struct io_uring_sqe* sqe_c2 = io_uring_get_sqe(&ring);
+      io_uring_prep_close(sqe_c2, destFd);
+      io_uring_submit(&ring);
+      struct io_uring_cqe* cqe_c1 = NULL;
+      struct io_uring_cqe* cqe_c2 = NULL;
+      while (io_uring_peek_cqe(&ring, &cqe_c1) != 0) {
+         __builtin_ia32_pause();
+      }
+      io_uring_cqe_seen(&ring, cqe_c1);
+      while (io_uring_peek_cqe(&ring, &cqe_c2) != 0) {
+         __builtin_ia32_pause();
+      }
+      io_uring_cqe_seen(&ring, cqe_c2);
    } else if (!exists && (flags & O_CREAT)) {
       OopWalRecord rec;
       rec.magic = RECORD_MAGIC;
@@ -327,27 +423,39 @@ int rename(const char* oldpath, const char* newpath) {
       make_vault_path(buffer, stat_buf.st_ino);
       struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
       io_uring_prep_link(sqe, newpath, buffer, 0);
+      sqe->flags |= IOSQE_IO_LINK;
+      struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
+      io_uring_prep_rename(sqe2, oldpath, newpath);
       io_uring_submit(&ring);
       struct io_uring_cqe* cqe = NULL;
-      io_uring_wait_cqe(&ring, &cqe);
+      struct io_uring_cqe* cqe2 = NULL;
+      while (io_uring_peek_cqe(&ring, &cqe) != 0) {
+         __builtin_ia32_pause();
+      }
       int link_res = cqe->res;
       io_uring_cqe_seen(&ring, cqe);
-      if (link_res < 0) {
-         int srcFd = gnu_open(newpath, O_RDONLY | O_CLOEXEC, 0600);
-         if (srcFd >= 0) {
-            int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
-            if (destFd >= 0) {
-               int cloneRes = -1;
+      while (io_uring_peek_cqe(&ring, &cqe2) != 0) {
+         __builtin_ia32_pause();
+      }
+      int rename_res = cqe2->res;
+      io_uring_cqe_seen(&ring, cqe2);
+      if (link_res >= 0) {
+         return (rename_res >= 0) ? 0 : -1;
+      }
+      int srcFd = gnu_open(newpath, O_RDONLY | O_CLOEXEC, 0600);
+      if (srcFd >= 0) {
+         int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+         if (destFd >= 0) {
+            int cloneRes = -1;
 #ifdef FICLONE
-               cloneRes = ioctl(destFd, FICLONE, srcFd);
+            cloneRes = ioctl(destFd, FICLONE, srcFd);
 #endif
-               if (cloneRes != 0) {
-                  sendfile(destFd, srcFd, NULL, stat_buf.st_size);
-               }
-               close(destFd);
+            if (cloneRes != 0) {
+               sendfile(destFd, srcFd, NULL, stat_buf.st_size);
             }
-            close(srcFd);
+            close(destFd);
          }
+         close(srcFd);
       }
    }
    OopWalRecord rec_rename;
@@ -395,29 +503,40 @@ int renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpat
       make_vault_path(buffer, stat_buf.st_ino);
       struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
       io_uring_prep_linkat(sqe, newdirfd, newpath, AT_FDCWD, buffer, (int)0);
+      sqe->flags |= IOSQE_IO_LINK;
+      struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
+      io_uring_prep_renameat(sqe2, olddirfd, oldpath, newdirfd, newpath, 0);
       io_uring_submit(&ring);
       struct io_uring_cqe* cqe = NULL;
-      io_uring_wait_cqe(&ring, &cqe);
+      struct io_uring_cqe* cqe2 = NULL;
+      while (io_uring_peek_cqe(&ring, &cqe) != 0) {
+         __builtin_ia32_pause();
+      }
       int link_res = cqe->res;
       io_uring_cqe_seen(&ring, cqe);
-      if (link_res < (int)0) {
-         int srcFd = gnu_openat(newdirfd, newpath, O_RDONLY | O_CLOEXEC, 0600);
-         if (srcFd >= 0) {
-            if (1) {
-               int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
-               if (destFd >= 0) {
-                  int cloneRes = -1;
+      while (io_uring_peek_cqe(&ring, &cqe2) != 0) {
+         __builtin_ia32_pause();
+      }
+      int rename_res = cqe2->res;
+      io_uring_cqe_seen(&ring, cqe2);
+      if (link_res >= 0) {
+         return (rename_res >= 0) ? 0 : -1;
+      }
+      int srcFd = gnu_openat(newdirfd, newpath, O_RDONLY | O_CLOEXEC, 0600);
+      if (srcFd >= 0) {
+         int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+         if (destFd >= 0) {
+            int cloneRes = -1;
 #ifdef FICLONE
-                  cloneRes = ioctl(destFd, FICLONE, srcFd);
+            cloneRes = ioctl(destFd, FICLONE, srcFd);
 #endif
-                  if (cloneRes != 0) {
-                     sendfile(destFd, srcFd, NULL, stat_buf.st_size);
-                  }
-                  close(destFd);
-               }
+            if (cloneRes != 0) {
+               sendfile(destFd, srcFd, NULL, stat_buf.st_size);
             }
-            close(srcFd);
+            close(destFd);
          }
+
+         close(srcFd);
       }
    }
    OopWalRecord rec_rename;
@@ -464,29 +583,39 @@ int renameat2(int olddirfd, const char* oldpath, int newdirfd, const char* newpa
       make_vault_path(buffer, stat_buf.st_ino);
       struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
       io_uring_prep_linkat(sqe, newdirfd, newpath, AT_FDCWD, buffer, (int)0);
+      sqe->flags |= IOSQE_IO_LINK;
+      struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
+      io_uring_prep_renameat(sqe2, olddirfd, oldpath, newdirfd, newpath, flags);
       io_uring_submit(&ring);
       struct io_uring_cqe* cqe = NULL;
-      io_uring_wait_cqe(&ring, &cqe);
+      struct io_uring_cqe* cqe2 = NULL;
+      while (io_uring_peek_cqe(&ring, &cqe) != 0) {
+         __builtin_ia32_pause();
+      }
       int link_res = cqe->res;
       io_uring_cqe_seen(&ring, cqe);
-      if (link_res < (int)0) {
-         int srcFd = gnu_openat(newdirfd, newpath, O_RDONLY | O_CLOEXEC, 0600);
-         if (srcFd >= 0) {
-            if (1) {
-               int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
-               if (destFd >= 0) {
-                  int cloneRes = -1;
+      while (io_uring_peek_cqe(&ring, &cqe2) != 0) {
+         __builtin_ia32_pause();
+      }
+      int rename_res = cqe2->res;
+      io_uring_cqe_seen(&ring, cqe2);
+      if (link_res >= 0) {
+         return (rename_res >= 0) ? 0 : -1;
+      }
+      int srcFd = gnu_openat(newdirfd, newpath, O_RDONLY | O_CLOEXEC, 0600);
+      if (srcFd >= 0) {
+         int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+         if (destFd >= 0) {
+            int cloneRes = -1;
 #ifdef FICLONE
-                  cloneRes = ioctl(destFd, FICLONE, srcFd);
+            cloneRes = ioctl(destFd, FICLONE, srcFd);
 #endif
-                  if (cloneRes != 0) {
-                     sendfile(destFd, srcFd, NULL, stat_buf.st_size);
-                  }
-                  close(destFd);
-               }
+            if (cloneRes != 0) {
+               sendfile(destFd, srcFd, NULL, stat_buf.st_size);
             }
-            close(srcFd);
+            close(destFd);
          }
+         close(srcFd);
       }
    }
    OopWalRecord rec_rename;

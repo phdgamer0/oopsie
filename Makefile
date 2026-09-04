@@ -12,6 +12,9 @@ test: build
 	mkdir -p /tmp/oopsie
 	cd build && ctest --output-on-failure
 	@echo "Tests done"
+	@echo "Removing test logs..."
+	rm build/*.wal*
+	@echo "Cleanup done"
 
 clear:
 	@echo "Clearing the folder..."
