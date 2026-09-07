@@ -71,6 +71,9 @@ int unlink(const char* path) {
    if (strncmp(path, "/tmp/oopsie/", 12) == 0) {
       return gnu_unlink(path);
    }
+   if (!WalFile_IsOpen(&GlobalWal)) {
+      return gnu_unlink(path);
+   }
    OopWalRecord rec;
    struct stat stat_buf;
    if (lstat(path, &stat_buf) == 0 && S_ISREG(stat_buf.st_mode)) {
@@ -134,6 +137,9 @@ int unlinkat(int dirfd, const char* path, int flags) {
       gnu_openat = (gnu_openat_t*)dlsym(RTLD_NEXT, "openat");
    }
    if (strncmp(path, "/tmp/oopsie/", 12) == 0) {
+      return gnu_unlinkat(dirfd, path, flags);
+   }
+   if (!WalFile_IsOpen(&GlobalWal)) {
       return gnu_unlinkat(dirfd, path, flags);
    }
    OopWalRecord rec;
@@ -205,6 +211,9 @@ int open(const char* pathname, int flags, ...) {
    if (strncmp(pathname, "/tmp/oopsie/", 12) == (int)0) {
       return gnu_open(pathname, flags, mode);
    }
+   if (!WalFile_IsOpen(&GlobalWal)) {
+      return gnu_open(pathname, flags, mode);
+   }
    struct stat stat_;
    int exists = (lstat(pathname, &stat_) == 0 && S_ISREG(stat_.st_mode));
    if (exists && ((flags & O_WRONLY) || (flags & O_RDWR) || (flags & O_TRUNC))) {
@@ -270,6 +279,9 @@ int openat(int dirfd, const char* pathname, int flags, ...) {
    if (strncmp(pathname, "/tmp/oopsie/", 12) == (int)0) {
       return gnu_openat(dirfd, pathname, flags, mode);
    }
+   if (!WalFile_IsOpen(&GlobalWal)) {
+      return gnu_openat(dirfd, pathname, flags, mode);
+   }
    struct stat stat_;
    int exists = (fstatat(dirfd, pathname, &stat_, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(stat_.st_mode));
    if (exists && ((flags & O_WRONLY) || (flags & O_RDWR) || (flags & O_TRUNC))) {
@@ -328,6 +340,9 @@ int rename(const char* oldpath, const char* newpath) {
       gnu_open = (gnu_open_t*)dlsym(RTLD_NEXT, "open");
    }
    if (strncmp(oldpath, "/tmp/oopsie/", 12) == 0 || strncmp(newpath, "/tmp/oopsie/", 12) == 0) {
+      return gnu_rename(oldpath, newpath);
+   }
+   if (!WalFile_IsOpen(&GlobalWal)) {
       return gnu_rename(oldpath, newpath);
    }
    struct stat stat_buf;
@@ -410,6 +425,9 @@ int renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpat
    if (strncmp(oldpath, "/tmp/oopsie/", 12) == 0 || strncmp(newpath, "/tmp/oopsie/", 12) == 0) {
       return gnu_renameat(olddirfd, oldpath, newdirfd, newpath);
    }
+   if (!WalFile_IsOpen(&GlobalWal)) {
+      return gnu_renameat(olddirfd, oldpath, newdirfd, newpath);
+   }
    struct stat stat_buf;
    if (fstatat(newdirfd, newpath, &stat_buf, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(stat_buf.st_mode)) {
       OopWalRecord rec_new;
@@ -489,6 +507,9 @@ int renameat2(int olddirfd, const char* oldpath, int newdirfd, const char* newpa
       gnu_open = (gnu_open_t*)dlsym(RTLD_NEXT, "open");
    }
    if (strncmp(oldpath, "/tmp/oopsie/", 12) == 0 || strncmp(newpath, "/tmp/oopsie/", 12) == 0) {
+      return gnu_renameat2(olddirfd, oldpath, newdirfd, newpath, flags);
+   }
+   if (!WalFile_IsOpen(&GlobalWal)) {
       return gnu_renameat2(olddirfd, oldpath, newdirfd, newpath, flags);
    }
    struct stat stat_buf;

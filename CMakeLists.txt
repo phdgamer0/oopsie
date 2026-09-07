@@ -7,6 +7,7 @@ enable_testing()
 
 # Build the WAL Engine as a static library
 add_library(oopsie_wal STATIC src/oopsie_wal.c)
+set_target_properties(oopsie_wal PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(oopsie_wal PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(oopsie_wal PRIVATE -O3 -Wall -Wextra -pedantic -std=c2x)
 

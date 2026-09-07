@@ -38,8 +38,8 @@ bool WalFile_Open(OopWalContext* __restrict WalFile, const char* __restrict Path
             }
          }
          close(tfd);
-         link(tmp_path, Path);
-         unlink(tmp_path);
+         (void)link(tmp_path, Path);
+         (void)unlink(tmp_path);
       }
       fd = open(Path, O_RDWR | O_CLOEXEC, 0600);
       if (fd < 0)
@@ -178,7 +178,7 @@ bool WalFile_Compact(OopWalContext* WalFile) {
    if (fd == -1) {
       return false;
    }
-   ftruncate(fd, WalFile->map_size);
+   (void)ftruncate(fd, WalFile->map_size);
    void* file = mmap(NULL, WalFile->map_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
    
    uintptr_t _new_offset = sizeof(WalHeader);
@@ -233,7 +233,11 @@ bool WalFile_Compact(OopWalContext* WalFile) {
    msync(file, WalFile->map_size, MS_SYNC);
    munmap(file, WalFile->map_size);
    close(fd);
+#ifdef SYS_rename
    syscall(SYS_rename, newpath, path);
+#else
+   syscall(SYS_renameat, AT_FDCWD, newpath, AT_FDCWD, path);
+#endif
    WalFile_Close(WalFile);
    WalFile_Open(WalFile, path);
    return true;
