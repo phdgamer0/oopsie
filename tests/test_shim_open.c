@@ -51,7 +51,7 @@ int main() {
       if (rec_ptr->action == OopAction_CREATE && strncmp(path_ptr, target, rec_ptr->pathlen) == 0) {
          found_create = 1;
       }
-      cursor += sizeof(OopWalRecord) + rec_ptr->pathlen + sizeof(uint32_t);
+      size_t rs = sizeof(OopWalRecord) + rec_ptr->pathlen + sizeof(uint32_t); cursor += (rs + 7) & ~(size_t)7;
    }
 
    if (!found_create) {
@@ -81,7 +81,7 @@ int main() {
       if (rec_ptr->action == OopAction_MODIFY && strncmp(path_ptr, target, rec_ptr->pathlen) == 0) {
          found_modify = 1;
       }
-      cursor += sizeof(OopWalRecord) + rec_ptr->pathlen + sizeof(uint32_t);
+      size_t rs = sizeof(OopWalRecord) + rec_ptr->pathlen + sizeof(uint32_t); cursor += (rs + 7) & ~(size_t)7;
    }
    WalFile_Close(&wal);
 

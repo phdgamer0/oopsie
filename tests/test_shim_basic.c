@@ -59,7 +59,7 @@ int main(void) {
          break;
       }
 
-      cursor += sizeof(OopWalRecord) + rec_ptr->pathlen + sizeof(uint32_t);
+      size_t rs = sizeof(OopWalRecord) + rec_ptr->pathlen + sizeof(uint32_t); cursor += (rs + 7) & ~(size_t)7;
    }
 
    WalFile_Close(&wal);
