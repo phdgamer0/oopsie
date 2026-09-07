@@ -18,14 +18,22 @@
 
 OopWalContext GlobalWal;
 struct io_uring ring;
+bool g_ring_ok = false;
 
 __attribute__((constructor)) void oopsie_init() {
+   mkdir("/tmp/oopsie", 0700);
    WalFile_Open(&GlobalWal, WAL_PATH);
    struct io_uring_params params;
    memset((void*)&params, (int)0, sizeof(params));
    params.flags = IORING_SETUP_SQPOLL;
    params.sq_thread_idle = (unsigned int)2000;
-   io_uring_queue_init_params((unsigned int)1024, &ring, &params);
+   int ret = io_uring_queue_init_params((unsigned int)1024, &ring, &params);
+   if (ret < 0) {
+      // Fallback for environments that restrict SQPOLL (e.g. GitHub Actions)
+      params.flags &= ~(unsigned int)IORING_SETUP_SQPOLL;
+      ret = io_uring_queue_init_params((unsigned int)1024, &ring, &params);
+   }
+   g_ring_ok = (ret == 0);
    char paths[VAULT_PATH_LEN];
    memcpy(paths, VAULT_PATH, VAULT_PATH_LEN);
    uint16_t i = 0;
@@ -38,7 +46,9 @@ __attribute__((constructor)) void oopsie_init() {
    }
 }
 __attribute__((destructor)) void oopsie_cleanup() {
-   io_uring_queue_exit(&ring);
+   if (g_ring_ok) {
+      io_uring_queue_exit(&ring);
+   }
    WalFile_Close(&GlobalWal);
 }
 
@@ -86,24 +96,31 @@ int unlink(const char* path) {
       WalFile_Append(&GlobalWal, path, &rec);
       char buffer[BUFFER_SZ];
       make_vault_path(buffer, stat_buf.st_ino);
-      struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-      io_uring_prep_link(sqe, path, buffer, 0);
-      sqe->flags |= IOSQE_IO_LINK;
-      struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
-      io_uring_prep_unlink(sqe2, path, 0);
-      io_uring_submit(&ring);
-      struct io_uring_cqe* cqe = NULL;
-      struct io_uring_cqe* cqe2 = NULL;
-      while (io_uring_peek_cqe(&ring, &cqe) != (int)0) {
-         __builtin_ia32_pause();
+      int link_res = 0;
+      int unlink_res = 0;
+      if (g_ring_ok) {
+         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+         io_uring_prep_link(sqe, path, buffer, 0);
+         sqe->flags |= IOSQE_IO_LINK;
+         struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
+         io_uring_prep_unlink(sqe2, path, 0);
+         io_uring_submit(&ring);
+         struct io_uring_cqe* cqe = NULL;
+         struct io_uring_cqe* cqe2 = NULL;
+         while (io_uring_peek_cqe(&ring, &cqe) != (int)0) {
+            __builtin_ia32_pause();
+         }
+         link_res = cqe->res;
+         io_uring_cqe_seen(&ring, cqe);
+         while (io_uring_peek_cqe(&ring, &cqe2) != (int)0) {
+            __builtin_ia32_pause();
+         }
+         unlink_res = cqe2->res;
+         io_uring_cqe_seen(&ring, cqe2);
+      } else {
+         link_res = link(path, buffer);
+         unlink_res = gnu_unlink(path);
       }
-      int link_res = cqe->res;
-      io_uring_cqe_seen(&ring, cqe);
-      while (io_uring_peek_cqe(&ring, &cqe2) != (int)0) {
-         __builtin_ia32_pause();
-      }
-      int unlink_res = cqe2->res;
-      io_uring_cqe_seen(&ring, cqe2);
       if (link_res >= (int)0) {
          return (unlink_res >= (int)0) ? (int)0 : (int)-1;
       }
@@ -154,26 +171,37 @@ int unlinkat(int dirfd, const char* path, int flags) {
       WalFile_Append(&GlobalWal, path, &rec);
       char buffer[BUFFER_SZ];
       make_vault_path(buffer, stat_buf.st_ino);
-      struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-      io_uring_prep_linkat(sqe, dirfd, path, AT_FDCWD, buffer, (int)0);
-      sqe->flags |= IOSQE_IO_LINK;
-      struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
-      io_uring_prep_unlinkat(sqe2, dirfd, path, flags);
-      io_uring_submit(&ring);
-      struct io_uring_cqe* cqe = NULL;
-      struct io_uring_cqe* cqe2 = NULL;
-      while (io_uring_peek_cqe(&ring, &cqe) != 0) {
-         __builtin_ia32_pause();
+      int link_res = 0;
+      int unlink_res = 0;
+      if (g_ring_ok) {
+         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+         if (sqe) {
+            io_uring_prep_linkat(sqe, dirfd, path, AT_FDCWD, buffer, 0);
+            sqe->flags |= IOSQE_IO_LINK;
+            struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
+            if (sqe2) {
+               io_uring_prep_unlinkat(sqe2, dirfd, path, flags);
+               io_uring_submit(&ring);
+            }
+         }
+         struct io_uring_cqe* cqe = NULL;
+         struct io_uring_cqe* cqe2 = NULL;
+         while (io_uring_peek_cqe(&ring, &cqe) != 0) {
+            __builtin_ia32_pause();
+         }
+         link_res = cqe->res;
+         io_uring_cqe_seen(&ring, cqe);
+         while (io_uring_peek_cqe(&ring, &cqe2) != 0) {
+            __builtin_ia32_pause();
+         }
+         unlink_res = cqe2->res;
+         io_uring_cqe_seen(&ring, cqe2);
+      } else {
+         link_res = linkat(dirfd, path, AT_FDCWD, buffer, 0);
+         unlink_res = gnu_unlinkat(dirfd, path, flags);
       }
-      int link_res = cqe->res;
-      io_uring_cqe_seen(&ring, cqe);
-      while (io_uring_peek_cqe(&ring, &cqe2) != 0) {
-         __builtin_ia32_pause();
-      }
-      int unlink_res = cqe2->res;
-      io_uring_cqe_seen(&ring, cqe2);
-      if (link_res >= (int)0) {
-         return (unlink_res >= (int)0) ? (int)0 : (int)-1;
+      if (link_res >= 0) {
+         return (unlink_res >= 0) ? 0 : -1;
       }
       int cloneRes = (int)-1;
       int srcFd = gnu_openat(dirfd, path, O_RDONLY | O_CLOEXEC, 0600);
