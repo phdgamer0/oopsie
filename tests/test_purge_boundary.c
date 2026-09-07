@@ -1,3 +1,4 @@
+#include <sys/stat.h>
 #include "../include/oopsie_wal.h"
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -7,6 +8,7 @@
 #include <unistd.h>
 
 int main(void) {
+   mkdir("/tmp/oopsie", 0700);
    OopWalContext reset_wal;
    if (WalFile_Open(&reset_wal, "/tmp/oopsie/vault.wal")) {
        WalHeader* hdr = (WalHeader*)reset_wal.map;

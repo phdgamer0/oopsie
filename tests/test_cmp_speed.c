@@ -1,3 +1,4 @@
+#include <sys/stat.h>
 #include "../include/oopsie_wal.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +11,7 @@ static double get_time_ms(struct timespec start, struct timespec end) {
 }
 
 int main(void) {
+   mkdir("/tmp/oopsie", 0700);
    printf("[TEST] Starting Sorter Speed Test (%d items)...\n", NUM_RECORDS);
    
    OopWalRecordView* views = malloc(sizeof(OopWalRecordView) * NUM_RECORDS);

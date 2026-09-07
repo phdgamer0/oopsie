@@ -1,9 +1,11 @@
+#include <sys/stat.h>
 #include "../include/oopsie_wal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 int main(void) {
+   mkdir("/tmp/oopsie", 0700);
    printf("[TEST] Starting Sorter Boundary Test...\n");
    
    OopWalRecord r1 = { .pathlen = 2, .timestamp = 100 };
