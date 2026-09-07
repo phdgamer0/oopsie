@@ -1,11 +1,15 @@
 #define _GNU_SOURCE
 #include "oopsie_wal.h"
 #include <fcntl.h>
+#include <liburing.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -65,7 +69,8 @@ size_t WalFile_Append(OopWalContext* __restrict WalFile, const char* __restrict 
             return WalFile_Append(WalFile, Path, RecP);
          }
          return 0;
-      } else {
+      }
+      else {
          return 0;
       }
    }
@@ -125,4 +130,154 @@ size_t WalFile_GetPrevious(const OopWalContext* WalFile, size_t current_offset, 
       return 0;
    }
    return prev_off;
+}
+
+size_t WalFile_Parse(const OopWalContext* WalFile, OopWalRecordView* views, size_t max_views) {
+   if (!WalFile->map)
+      return (size_t)0;
+   size_t _views = (size_t)0;
+   WalHeader* header = (WalHeader*)(WalFile->map);
+   uintptr_t _offset = (uintptr_t)sizeof(WalHeader);
+   while (_offset < header->current_offset && _views < max_views) {
+      OopWalRecord* curr_rec = (OopWalRecord*)((uintptr_t)WalFile->map + _offset);
+      if (curr_rec->magic == RECORD_MAGIC) {
+         views[_views].rec = curr_rec;
+         views[_views++].path = (const char*)((uintptr_t)curr_rec + (uintptr_t)sizeof(*curr_rec)); // we can later replace the size of with a const
+      }
+      else if (curr_rec->magic != TOMBSTONE_MAGIC) {
+         break;
+      }
+      _offset += (uintptr_t)((uintptr_t)sizeof(*curr_rec) + (uintptr_t)(curr_rec->pathlen) + (uintptr_t)(sizeof(curr_rec->pathlen)));
+   }
+   return _views;
+}
+
+void WalFile_Purge(OopWalContext* WalFile, OopWalRecordView* view) {
+   if (!WalFile->map)
+      return;
+   __atomic_store_n(&view->rec->magic, TOMBSTONE_MAGIC, __ATOMIC_SEQ_CST);
+   __atomic_add_fetch(&((WalHeader*)WalFile->map)->toombstone, 1, __ATOMIC_SEQ_CST);
+   if (((WalHeader*)(WalFile->map))->toombstone >= TOMBSTONE_LIMIT) {
+      WalFile_Compact(WalFile);
+   }
+}
+
+bool WalFile_Compact(OopWalContext* WalFile) {
+   if (!WalFile)
+      return false;
+
+   const WalHeader* oldheader = (const WalHeader*)WalFile->map;
+
+   const char* path = WalFile->path;
+   size_t len = strlen(path);
+   char newpath[256];
+   memcpy(newpath, path, len);
+   newpath[len] = '\0';
+   memmove((void*)((uintptr_t)newpath + (uintptr_t)len - (uintptr_t)3), "tmp", 3);
+   int fd = open(newpath, O_RDWR | O_CREAT | O_TRUNC, 0666);
+   if (fd == -1) {
+      return false;
+   }
+   ftruncate(fd, WalFile->map_size);
+   void* file = mmap(NULL, WalFile->map_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+   
+   uintptr_t _new_offset = sizeof(WalHeader);
+   uintptr_t _old_offset = sizeof(WalHeader);
+   const uintptr_t _max_offset = (uintptr_t)oldheader->current_offset;
+   
+   struct io_uring ring;
+   bool ring_ok = (io_uring_queue_init(TOMBSTONE_LIMIT, &ring, 0) == 0);
+   char vault_paths[TOMBSTONE_LIMIT][BUFFER_SZ];
+   uint32_t chunk_count = 0;
+
+   while (_old_offset < _max_offset) {
+      const OopWalRecord* rec = (const OopWalRecord*)((uintptr_t)WalFile->map + _old_offset);
+      if (rec->magic == RECORD_MAGIC) {
+         memcpy((void*)((uintptr_t)file + _new_offset), rec, sizeof(OopWalRecord) + rec->pathlen + sizeof(uint32_t));
+         _new_offset += sizeof(OopWalRecord) + rec->pathlen + sizeof(rec->pathlen);
+      } else if (rec->magic == TOMBSTONE_MAGIC && ring_ok) {
+         make_vault_path(vault_paths[chunk_count], rec->inode);
+         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+         if (sqe) {
+            io_uring_prep_unlinkat(sqe, AT_FDCWD, vault_paths[chunk_count], 0);
+         }
+         chunk_count++;
+         if (chunk_count == TOMBSTONE_LIMIT) {
+            io_uring_submit(&ring);
+            for (uint32_t i = 0; i < TOMBSTONE_LIMIT; i++) {
+               struct io_uring_cqe* cqe;
+               if (io_uring_wait_cqe(&ring, &cqe) == 0) io_uring_cqe_seen(&ring, cqe);
+            }
+            chunk_count = 0;
+         }
+      }
+      _old_offset += sizeof(OopWalRecord) + rec->pathlen + sizeof(rec->pathlen);
+   }
+
+   if (ring_ok) {
+      if (chunk_count > 0) {
+         io_uring_submit(&ring);
+         for (uint32_t i = 0; i < chunk_count; i++) {
+            struct io_uring_cqe* cqe;
+            if (io_uring_wait_cqe(&ring, &cqe) == 0) io_uring_cqe_seen(&ring, cqe);
+         }
+      }
+      io_uring_queue_exit(&ring);
+   }
+
+   WalHeader header;
+   header.magic = WAL_HEADER_MAGIC;
+   header.current_offset = _new_offset;
+   header.toombstone = (uint32_t)0;
+   memcpy(file, &header, sizeof(WalHeader));
+   msync(file, WalFile->map_size, MS_SYNC);
+   munmap(file, WalFile->map_size);
+   close(fd);
+   syscall(SYS_rename, newpath, path);
+   WalFile_Close(WalFile);
+   WalFile_Open(WalFile, path);
+   return true;
+}
+
+int cmp_wal_time(const void* a, const void* b) {
+   if (!a || !b)
+      return -2;
+   const OopWalRecordView* _a = (const OopWalRecordView*)a;
+   const OopWalRecordView* _b = (const OopWalRecordView*)b;
+   const uint64_t __a = _a->rec->timestamp;
+   const uint64_t __b = _b->rec->timestamp;
+   return (int)((__a > __b) - (__a < __b));
+}
+
+int cmp_wal_name_asc(const void* a, const void* b) {
+   if (!a || !b)
+      return -2;
+   const OopWalRecordView* _a = (const OopWalRecordView*)a;
+   const OopWalRecordView* _b = (const OopWalRecordView*)b;
+   size_t __a = _a->rec->pathlen;
+   size_t __b = _b->rec->pathlen;
+   size_t min = (__a < __b) ? __a : __b;
+   int res = strncmp(_a->path, _b->path, min);
+   if (res != 0)
+      return res;
+   if (__a != __b)
+      return (__a > __b) - (__a < __b);
+   return cmp_wal_time(a, b);
+}
+
+void make_vault_path(char* buffer, unsigned long ino) {
+   char temp[48];
+   memcpy(buffer, "/tmp/oopsie/000/vault_", 22);
+   uint8_t i = (uint8_t)(ino & UINT8_MAX);
+   buffer[VAULT_PATH_LEN - 2] = (char)((i % (uint8_t)10) + (char)'0');
+   buffer[VAULT_PATH_LEN - 3] = (char)(((i / (uint8_t)10) % (uint8_t)10) + (char)'0');
+   buffer[VAULT_PATH_LEN - 4] = (char)(i / (uint8_t)100 + (char)'0');
+   char* p = temp + 47;
+   *p = '\0';
+   do {
+      *--p = '0' + (ino % 10);
+      ino /= 10;
+   } while (ino > 0);
+   size_t len = (temp + 47) - p + 1;
+   memcpy(buffer + 22, p, len);
 }
