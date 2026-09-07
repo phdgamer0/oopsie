@@ -1,6 +1,9 @@
-Language: C
+Language: Cpp
 ColumnLimit: 0
 IndentWidth: 3
 UseTab: Never
 PointerAlignment: Left
 AllowShortFunctionsOnASingleLine: None
+BreakBeforeBraces: Custom
+BraceWrapping:
+  BeforeElse: true
