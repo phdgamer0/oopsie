@@ -1,9 +1,9 @@
 #pragma once
 
-#include <stdatomic.h>
 #ifndef OOPSIE_WAL_H
 #define OOPSIE_WAL_H
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

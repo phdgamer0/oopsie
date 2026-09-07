@@ -16,6 +16,15 @@
 #include <time.h>
 #include <unistd.h>
 
+
+#if defined(__x86_64__) || defined(__i386__)
+#define CPU_PAUSE() __builtin_ia32_pause()
+#elif defined(__aarch64__) || defined(__arm__)
+#define CPU_PAUSE() __asm__ volatile("yield" ::: "memory")
+#else
+#define CPU_PAUSE()
+#endif
+
 OopWalContext GlobalWal;
 struct io_uring ring;
 bool g_ring_ok = false;
@@ -108,12 +117,12 @@ int unlink(const char* path) {
          struct io_uring_cqe* cqe = NULL;
          struct io_uring_cqe* cqe2 = NULL;
          while (io_uring_peek_cqe(&ring, &cqe) != (int)0) {
-            __builtin_ia32_pause();
+            CPU_PAUSE();
          }
          link_res = cqe->res;
          io_uring_cqe_seen(&ring, cqe);
          while (io_uring_peek_cqe(&ring, &cqe2) != (int)0) {
-            __builtin_ia32_pause();
+            CPU_PAUSE();
          }
          unlink_res = cqe2->res;
          io_uring_cqe_seen(&ring, cqe2);
@@ -187,12 +196,12 @@ int unlinkat(int dirfd, const char* path, int flags) {
          struct io_uring_cqe* cqe = NULL;
          struct io_uring_cqe* cqe2 = NULL;
          while (io_uring_peek_cqe(&ring, &cqe) != 0) {
-            __builtin_ia32_pause();
+            CPU_PAUSE();
          }
          link_res = cqe->res;
          io_uring_cqe_seen(&ring, cqe);
          while (io_uring_peek_cqe(&ring, &cqe2) != 0) {
-            __builtin_ia32_pause();
+            CPU_PAUSE();
          }
          unlink_res = cqe2->res;
          io_uring_cqe_seen(&ring, cqe2);
@@ -394,12 +403,12 @@ int rename(const char* oldpath, const char* newpath) {
       struct io_uring_cqe* cqe = NULL;
       struct io_uring_cqe* cqe2 = NULL;
       while (io_uring_peek_cqe(&ring, &cqe) != 0) {
-         __builtin_ia32_pause();
+         CPU_PAUSE();
       }
       int link_res = cqe->res;
       io_uring_cqe_seen(&ring, cqe);
       while (io_uring_peek_cqe(&ring, &cqe2) != 0) {
-         __builtin_ia32_pause();
+         CPU_PAUSE();
       }
       int rename_res = cqe2->res;
       io_uring_cqe_seen(&ring, cqe2);
@@ -477,12 +486,12 @@ int renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpat
       struct io_uring_cqe* cqe = NULL;
       struct io_uring_cqe* cqe2 = NULL;
       while (io_uring_peek_cqe(&ring, &cqe) != 0) {
-         __builtin_ia32_pause();
+         CPU_PAUSE();
       }
       int link_res = cqe->res;
       io_uring_cqe_seen(&ring, cqe);
       while (io_uring_peek_cqe(&ring, &cqe2) != 0) {
-         __builtin_ia32_pause();
+         CPU_PAUSE();
       }
       int rename_res = cqe2->res;
       io_uring_cqe_seen(&ring, cqe2);
@@ -560,12 +569,12 @@ int renameat2(int olddirfd, const char* oldpath, int newdirfd, const char* newpa
       struct io_uring_cqe* cqe = NULL;
       struct io_uring_cqe* cqe2 = NULL;
       while (io_uring_peek_cqe(&ring, &cqe) != 0) {
-         __builtin_ia32_pause();
+         CPU_PAUSE();
       }
       int link_res = cqe->res;
       io_uring_cqe_seen(&ring, cqe);
       while (io_uring_peek_cqe(&ring, &cqe2) != 0) {
-         __builtin_ia32_pause();
+         CPU_PAUSE();
       }
       int rename_res = cqe2->res;
       io_uring_cqe_seen(&ring, cqe2);
