@@ -57,6 +57,7 @@ bool WalFile_Open(OopWalContext* __restrict WalFile, const char* __restrict Path
 
 size_t WalFile_Append(OopWalContext* __restrict WalFile, const char* __restrict Path, const OopWalRecord* __restrict RecP) {
    size_t required = sizeof(OopWalRecord) + RecP->pathlen + sizeof(uint32_t);
+   required = (required + 7) & ~(size_t)7;
    WalHeader* header = (WalHeader*)WalFile->map;
    uint64_t old_off = __atomic_fetch_add(&header->current_offset, required, __ATOMIC_SEQ_CST);
    if (old_off + required > WalFile->map_size) { // The segment is full
@@ -78,8 +79,8 @@ size_t WalFile_Append(OopWalContext* __restrict WalFile, const char* __restrict 
    memcpy(dest, RecP, sizeof(OopWalRecord));
    dest = (void*)((uintptr_t)dest + sizeof(OopWalRecord));
    memcpy(dest, Path, RecP->pathlen);
-   dest = (void*)((uintptr_t)dest + RecP->pathlen);
-   memcpy(dest, &RecP->pathlen, sizeof(uint32_t));
+   void* suffix_dest = (void*)((uintptr_t)WalFile->map + old_off + required - sizeof(uint32_t));
+   memcpy(suffix_dest, &RecP->pathlen, sizeof(uint32_t));
 
    return required;
 }
@@ -114,17 +115,20 @@ size_t WalFile_GetPrevious(const OopWalContext* WalFile, size_t current_offset, 
    void* PathEnd = (void*)((uintptr_t)WalFile->map + current_offset - sizeof(uint32_t));
    uint32_t PathLen = *(uint32_t*)PathEnd;
    size_t total_record_size = sizeof(OopWalRecord) + PathLen + sizeof(uint32_t);
+   total_record_size = (total_record_size + 7) & ~(size_t)7;
    if (current_offset < total_record_size + sizeof(WalHeader)) {
+      printf("Failed 1: curr_off %zu, total_rec %zu\n", current_offset, total_record_size);
       return (size_t)-1;
    }
-   void* PathStart = (void*)((uintptr_t)PathEnd - PathLen);
-   memcpy(OutPath, PathStart, PathLen);
-   OutPath[PathLen] = '\0';
-   void* RecStart = (void*)((uintptr_t)PathStart - sizeof(OopWalRecord));
+   void* RecStart = (void*)((uintptr_t)WalFile->map + current_offset - total_record_size);
    if (*(uint32_t*)RecStart != RECORD_MAGIC) {
+      printf("Failed 2: magic %x != %x\n", *(uint32_t*)RecStart, RECORD_MAGIC);
       return (size_t)-1;
    }
    memcpy(OutRec, RecStart, sizeof(OopWalRecord));
+   void* PathStart = (void*)((uintptr_t)RecStart + sizeof(OopWalRecord));
+   memcpy(OutPath, PathStart, PathLen);
+   OutPath[PathLen] = '\0';
    size_t prev_off = current_offset - total_record_size;
    if (prev_off == sizeof(WalHeader)) {
       return 0;
@@ -140,6 +144,8 @@ size_t WalFile_Parse(const OopWalContext* WalFile, OopWalRecordView* views, size
    uintptr_t _offset = (uintptr_t)sizeof(WalHeader);
    while (_offset < header->current_offset && _views < max_views) {
       OopWalRecord* curr_rec = (OopWalRecord*)((uintptr_t)WalFile->map + _offset);
+      size_t rec_size = sizeof(OopWalRecord) + curr_rec->pathlen + sizeof(uint32_t);
+      rec_size = (rec_size + 7) & ~(size_t)7;
       if (curr_rec->magic == RECORD_MAGIC) {
          views[_views].rec = curr_rec;
          views[_views++].path = (const char*)((uintptr_t)curr_rec + (uintptr_t)sizeof(*curr_rec)); // we can later replace the size of with a const
@@ -147,7 +153,7 @@ size_t WalFile_Parse(const OopWalContext* WalFile, OopWalRecordView* views, size
       else if (curr_rec->magic != TOMBSTONE_MAGIC) {
          break;
       }
-      _offset += (uintptr_t)((uintptr_t)sizeof(*curr_rec) + (uintptr_t)(curr_rec->pathlen) + (uintptr_t)(sizeof(curr_rec->pathlen)));
+      _offset += rec_size;
    }
    return _views;
 }
@@ -178,8 +184,15 @@ bool WalFile_Compact(OopWalContext* WalFile) {
    if (fd == -1) {
       return false;
    }
-   (void)ftruncate(fd, WalFile->map_size);
+   if (ftruncate(fd, WalFile->map_size) != 0) {
+      close(fd);
+      return false;
+   }
    void* file = mmap(NULL, WalFile->map_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+   if (file == MAP_FAILED) {
+      close(fd);
+      return false;
+   }
    
    uintptr_t _new_offset = sizeof(WalHeader);
    uintptr_t _old_offset = sizeof(WalHeader);
@@ -192,9 +205,11 @@ bool WalFile_Compact(OopWalContext* WalFile) {
 
    while (_old_offset < _max_offset) {
       const OopWalRecord* rec = (const OopWalRecord*)((uintptr_t)WalFile->map + _old_offset);
+      size_t rec_size = sizeof(OopWalRecord) + rec->pathlen + sizeof(uint32_t);
+      rec_size = (rec_size + 7) & ~(size_t)7;
       if (rec->magic == RECORD_MAGIC) {
-         memcpy((void*)((uintptr_t)file + _new_offset), rec, sizeof(OopWalRecord) + rec->pathlen + sizeof(uint32_t));
-         _new_offset += sizeof(OopWalRecord) + rec->pathlen + sizeof(rec->pathlen);
+         memcpy((void*)((uintptr_t)file + _new_offset), rec, rec_size);
+         _new_offset += rec_size;
       } else if (rec->magic == TOMBSTONE_MAGIC && ring_ok) {
          make_vault_path(vault_paths[chunk_count], rec->inode);
          struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
@@ -211,7 +226,7 @@ bool WalFile_Compact(OopWalContext* WalFile) {
             chunk_count = 0;
          }
       }
-      _old_offset += sizeof(OopWalRecord) + rec->pathlen + sizeof(rec->pathlen);
+      _old_offset += rec_size;
    }
 
    if (ring_ok) {
