@@ -68,6 +68,7 @@ set_target_properties(uring PROPERTIES
     IMPORTED_LOCATION ${SOURCE_DIR}/src/liburing.a
     INTERFACE_INCLUDE_DIRECTORIES ${SOURCE_DIR}/src/include
 )
+target_link_libraries(oopsie_wal PUBLIC uring)
 
 add_library(oopsie_shim SHARED src/shim.c)
 target_link_libraries(oopsie_shim PRIVATE oopsie_wal uring ${CMAKE_DL_LIBS})
@@ -97,3 +98,64 @@ add_executable(test_shim_rename tests/test_shim_rename.c)
 target_link_libraries(test_shim_rename PRIVATE oopsie_wal)
 add_test(NAME test_shim_rename COMMAND test_shim_rename)
 set_tests_properties(test_shim_rename PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:oopsie_shim>")
+
+# New Parser Tests
+add_executable(test_parse_basic tests/test_parse_basic.c)
+target_link_libraries(test_parse_basic PRIVATE oopsie_wal)
+add_test(NAME test_parse_basic COMMAND test_parse_basic)
+set_tests_properties(test_parse_basic PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:oopsie_shim>")
+
+add_executable(test_parse_boundary tests/test_parse_boundary.c)
+target_link_libraries(test_parse_boundary PRIVATE oopsie_wal)
+add_test(NAME test_parse_boundary COMMAND test_parse_boundary)
+set_tests_properties(test_parse_boundary PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:oopsie_shim>")
+
+add_executable(test_parse_speed tests/test_parse_speed.c)
+target_link_libraries(test_parse_speed PRIVATE oopsie_wal)
+add_test(NAME test_parse_speed COMMAND test_parse_speed)
+set_tests_properties(test_parse_speed PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:oopsie_shim>")
+
+# New Purger Tests
+add_executable(test_purge_basic tests/test_purge_basic.c)
+target_link_libraries(test_purge_basic PRIVATE oopsie_wal)
+add_test(NAME test_purge_basic COMMAND test_purge_basic)
+set_tests_properties(test_purge_basic PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:oopsie_shim>")
+
+add_executable(test_purge_boundary tests/test_purge_boundary.c)
+target_link_libraries(test_purge_boundary PRIVATE oopsie_wal)
+add_test(NAME test_purge_boundary COMMAND test_purge_boundary)
+set_tests_properties(test_purge_boundary PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:oopsie_shim>")
+
+add_executable(test_purge_speed tests/test_purge_speed.c)
+target_link_libraries(test_purge_speed PRIVATE oopsie_wal)
+add_test(NAME test_purge_speed COMMAND test_purge_speed)
+set_tests_properties(test_purge_speed PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:oopsie_shim>")
+
+# New Compactor Tests
+add_executable(test_compact_basic tests/test_compact_basic.c)
+target_link_libraries(test_compact_basic PRIVATE oopsie_wal)
+add_test(NAME test_compact_basic COMMAND test_compact_basic)
+set_tests_properties(test_compact_basic PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:oopsie_shim>")
+
+add_executable(test_compact_boundary tests/test_compact_boundary.c)
+target_link_libraries(test_compact_boundary PRIVATE oopsie_wal)
+add_test(NAME test_compact_boundary COMMAND test_compact_boundary)
+set_tests_properties(test_compact_boundary PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:oopsie_shim>")
+
+add_executable(test_compact_speed tests/test_compact_speed.c)
+target_link_libraries(test_compact_speed PRIVATE oopsie_wal)
+add_test(NAME test_compact_speed COMMAND test_compact_speed)
+set_tests_properties(test_compact_speed PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:oopsie_shim>")
+
+# New Compare Tests
+add_executable(test_cmp_basic tests/test_cmp_basic.c)
+target_link_libraries(test_cmp_basic PRIVATE oopsie_wal)
+add_test(NAME test_cmp_basic COMMAND test_cmp_basic)
+
+add_executable(test_cmp_boundary tests/test_cmp_boundary.c)
+target_link_libraries(test_cmp_boundary PRIVATE oopsie_wal)
+add_test(NAME test_cmp_boundary COMMAND test_cmp_boundary)
+
+add_executable(test_cmp_speed tests/test_cmp_speed.c)
+target_link_libraries(test_cmp_speed PRIVATE oopsie_wal)
+add_test(NAME test_cmp_speed COMMAND test_cmp_speed)
