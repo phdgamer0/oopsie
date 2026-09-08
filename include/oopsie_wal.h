@@ -37,6 +37,7 @@ typedef struct {
 
 typedef struct {
    uint32_t magic;
+   uint32_t is_monitoring;
    uint32_t toombstone;
    uint64_t current_offset;
 } WalHeader;

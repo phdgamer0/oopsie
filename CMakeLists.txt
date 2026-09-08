@@ -5,6 +5,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Enable CTest framework
 enable_testing()
 
+# Enable ccache if available to cache build artifacts (even after make clean)
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    message(STATUS "ccache enabled")
+endif()
+
 # Build the WAL Engine as a static library
 add_library(oopsie_wal STATIC src/oopsie_wal.c)
 set_target_properties(oopsie_wal PROPERTIES POSITION_INDEPENDENT_CODE ON)

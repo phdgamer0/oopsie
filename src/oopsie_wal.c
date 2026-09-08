@@ -32,6 +32,7 @@ bool WalFile_Open(OopWalContext* __restrict WalFile, const char* __restrict Path
             if (tmap != MAP_FAILED) {
                WalHeader* header = (WalHeader*)tmap;
                header->magic = WAL_HEADER_MAGIC;
+               header->is_monitoring = 1;
                header->current_offset = sizeof(WalHeader);
                msync(tmap, WalFile->map_size, MS_SYNC);
                munmap(tmap, WalFile->map_size);
@@ -242,6 +243,7 @@ bool WalFile_Compact(OopWalContext* WalFile) {
 
    WalHeader header;
    header.magic = WAL_HEADER_MAGIC;
+   header.is_monitoring = 1;
    header.current_offset = _new_offset;
    header.toombstone = (uint32_t)0;
    memcpy(file, &header, sizeof(WalHeader));

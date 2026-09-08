@@ -16,6 +16,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#define SHIM_SHOULD_MONITOR() (WalFile_IsOpen(&GlobalWal) && __atomic_load_n(&((WalHeader*)GlobalWal.map)->is_monitoring, __ATOMIC_RELAXED) == 1)
 
 #if defined(__x86_64__) || defined(__i386__)
 #define CPU_PAUSE() __builtin_ia32_pause()
@@ -38,7 +39,7 @@ __attribute__((constructor)) void oopsie_init() {
    params.sq_thread_idle = (unsigned int)2000;
    int ret = io_uring_queue_init_params((unsigned int)1024, &ring, &params);
    if (ret < 0) {
-      // Fallback for environments that restrict SQPOLL (e.g. GitHub Actions)
+      // Fallback for environments that restrict SQPOLL
       params.flags &= ~(unsigned int)IORING_SETUP_SQPOLL;
       ret = io_uring_queue_init_params((unsigned int)1024, &ring, &params);
    }
@@ -90,7 +91,7 @@ int unlink(const char* path) {
    if (strncmp(path, "/tmp/oopsie/", 12) == 0) {
       return gnu_unlink(path);
    }
-   if (!WalFile_IsOpen(&GlobalWal)) {
+   if (!SHIM_SHOULD_MONITOR()) {
       return gnu_unlink(path);
    }
    OopWalRecord rec;
@@ -126,7 +127,8 @@ int unlink(const char* path) {
          }
          unlink_res = cqe2->res;
          io_uring_cqe_seen(&ring, cqe2);
-      } else {
+      }
+      else {
          link_res = link(path, buffer);
          unlink_res = gnu_unlink(path);
       }
@@ -165,7 +167,7 @@ int unlinkat(int dirfd, const char* path, int flags) {
    if (strncmp(path, "/tmp/oopsie/", 12) == 0) {
       return gnu_unlinkat(dirfd, path, flags);
    }
-   if (!WalFile_IsOpen(&GlobalWal)) {
+   if (!SHIM_SHOULD_MONITOR()) {
       return gnu_unlinkat(dirfd, path, flags);
    }
    OopWalRecord rec;
@@ -205,7 +207,8 @@ int unlinkat(int dirfd, const char* path, int flags) {
          }
          unlink_res = cqe2->res;
          io_uring_cqe_seen(&ring, cqe2);
-      } else {
+      }
+      else {
          link_res = linkat(dirfd, path, AT_FDCWD, buffer, 0);
          unlink_res = gnu_unlinkat(dirfd, path, flags);
       }
@@ -248,7 +251,7 @@ int open(const char* pathname, int flags, ...) {
    if (strncmp(pathname, "/tmp/oopsie/", 12) == (int)0) {
       return gnu_open(pathname, flags, mode);
    }
-   if (!WalFile_IsOpen(&GlobalWal)) {
+   if (!SHIM_SHOULD_MONITOR()) {
       return gnu_open(pathname, flags, mode);
    }
    struct stat stat_;
@@ -265,7 +268,8 @@ int open(const char* pathname, int flags, ...) {
       char buffer[BUFFER_SZ];
       make_vault_path(buffer, stat_.st_ino);
       if (flags & O_TRUNC) {
-         if (gnu_rename == NULL) gnu_rename = (gnu_rename_t*)dlsym(RTLD_NEXT, "rename");
+         if (gnu_rename == NULL)
+            gnu_rename = (gnu_rename_t*)dlsym(RTLD_NEXT, "rename");
          if (gnu_rename(pathname, buffer) == 0) {
             return gnu_open(pathname, flags | O_CREAT, stat_.st_mode);
          }
@@ -316,7 +320,7 @@ int openat(int dirfd, const char* pathname, int flags, ...) {
    if (strncmp(pathname, "/tmp/oopsie/", 12) == (int)0) {
       return gnu_openat(dirfd, pathname, flags, mode);
    }
-   if (!WalFile_IsOpen(&GlobalWal)) {
+   if (!SHIM_SHOULD_MONITOR()) {
       return gnu_openat(dirfd, pathname, flags, mode);
    }
    struct stat stat_;
@@ -333,7 +337,8 @@ int openat(int dirfd, const char* pathname, int flags, ...) {
       char buffer[BUFFER_SZ];
       make_vault_path(buffer, stat_.st_ino);
       if (flags & O_TRUNC) {
-         if (gnu_renameat == NULL) gnu_renameat = (gnu_renameat_t*)dlsym(RTLD_NEXT, "renameat");
+         if (gnu_renameat == NULL)
+            gnu_renameat = (gnu_renameat_t*)dlsym(RTLD_NEXT, "renameat");
          if (gnu_renameat(dirfd, pathname, AT_FDCWD, buffer) == 0) {
             return gnu_openat(dirfd, pathname, flags | O_CREAT, stat_.st_mode);
          }
@@ -379,7 +384,7 @@ int rename(const char* oldpath, const char* newpath) {
    if (strncmp(oldpath, "/tmp/oopsie/", 12) == 0 || strncmp(newpath, "/tmp/oopsie/", 12) == 0) {
       return gnu_rename(oldpath, newpath);
    }
-   if (!WalFile_IsOpen(&GlobalWal)) {
+   if (!SHIM_SHOULD_MONITOR()) {
       return gnu_rename(oldpath, newpath);
    }
    struct stat stat_buf;
@@ -462,7 +467,7 @@ int renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpat
    if (strncmp(oldpath, "/tmp/oopsie/", 12) == 0 || strncmp(newpath, "/tmp/oopsie/", 12) == 0) {
       return gnu_renameat(olddirfd, oldpath, newdirfd, newpath);
    }
-   if (!WalFile_IsOpen(&GlobalWal)) {
+   if (!SHIM_SHOULD_MONITOR()) {
       return gnu_renameat(olddirfd, oldpath, newdirfd, newpath);
    }
    struct stat stat_buf;
@@ -546,7 +551,7 @@ int renameat2(int olddirfd, const char* oldpath, int newdirfd, const char* newpa
    if (strncmp(oldpath, "/tmp/oopsie/", 12) == 0 || strncmp(newpath, "/tmp/oopsie/", 12) == 0) {
       return gnu_renameat2(olddirfd, oldpath, newdirfd, newpath, flags);
    }
-   if (!WalFile_IsOpen(&GlobalWal)) {
+   if (!SHIM_SHOULD_MONITOR()) {
       return gnu_renameat2(olddirfd, oldpath, newdirfd, newpath, flags);
    }
    struct stat stat_buf;
