@@ -122,8 +122,9 @@ size_t WalFile_GetPrevious(const OopWalContext* WalFile, size_t current_offset, 
       return (size_t)-1;
    }
    void* RecStart = (void*)((uintptr_t)WalFile->map + current_offset - total_record_size);
-   if (*(uint32_t*)RecStart != RECORD_MAGIC) {
-      printf("Failed 2: magic %x != %x\n", *(uint32_t*)RecStart, RECORD_MAGIC);
+   OopWalRecord* rec_ptr = (OopWalRecord*)RecStart;
+   if (rec_ptr->magic != RECORD_MAGIC) {
+      printf("Failed 2: magic %x != %x\n", rec_ptr->magic, RECORD_MAGIC);
       return (size_t)-1;
    }
    memcpy(OutRec, RecStart, sizeof(OopWalRecord));

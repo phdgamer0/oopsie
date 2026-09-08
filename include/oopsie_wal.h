@@ -27,19 +27,19 @@ typedef enum : uint8_t {
 
 #pragma pack(push, 1)
 typedef struct {
-   uint32_t magic;
-   uint8_t action;
    uint64_t timestamp;
    uint64_t filesize;
    uint64_t inode;
+   uint32_t magic;
    uint32_t pathlen;
+   uint8_t action;
 } OopWalRecord;
 
 typedef struct {
    uint32_t magic;
    uint32_t is_monitoring;
-   uint32_t toombstone;
    uint64_t current_offset;
+   uint32_t toombstone;
 } WalHeader;
 #pragma pack(pop)
 
