@@ -165,9 +165,6 @@ void WalFile_Purge(OopWalContext* WalFile, OopWalRecordView* view) {
       return;
    __atomic_store_n(&view->rec->magic, TOMBSTONE_MAGIC, __ATOMIC_SEQ_CST);
    __atomic_add_fetch(&((WalHeader*)WalFile->map)->toombstone, 1, __ATOMIC_SEQ_CST);
-   if (((WalHeader*)(WalFile->map))->toombstone >= TOMBSTONE_LIMIT) {
-      WalFile_Compact(WalFile);
-   }
 }
 
 bool WalFile_Compact(OopWalContext* WalFile) {
