@@ -28,3 +28,4 @@ build/CMakeFiles/Oopsie.dir/src/main.c.o
 build/CMakeFiles/Oopsie.dir/src/main.c.o.d
 build/compile_commands.json
 compile_commands.json
+*.bak

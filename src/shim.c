@@ -1,8 +1,6 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <fcntl.h>
-#include <liburing.h>
-#include <liburing/io_uring.h>
 #include <linux/fs.h>
 #include <oopsie_wal.h>
 #include <stdarg.h>
@@ -18,32 +16,21 @@
 
 #define SHIM_SHOULD_MONITOR() (WalFile_IsOpen(&GlobalWal) && __atomic_load_n(&((WalHeader*)GlobalWal.map)->is_monitoring, __ATOMIC_RELAXED) == 1)
 
-#if defined(__x86_64__) || defined(__i386__)
-#define CPU_PAUSE() __builtin_ia32_pause()
-#elif defined(__aarch64__) || defined(__arm__)
-#define CPU_PAUSE() __asm__ volatile("yield" ::: "memory")
-#else
-#define CPU_PAUSE()
-#endif
+static inline bool is_ignored_path(const char* p) {
+   if (!p) return true;
+   if (strncmp(p, "/tmp/oopsie/", 12) == 0) return true;
+   if (strncmp(p, "/dev/", 5) == 0) return true;
+   if (strncmp(p, "/sys/", 5) == 0) return true;
+   if (strncmp(p, "/proc/", 6) == 0) return true;
+   return false;
+}
+
 
 OopWalContext GlobalWal;
-struct io_uring ring;
-bool g_ring_ok = false;
 
 __attribute__((constructor)) void oopsie_init() {
    mkdir("/tmp/oopsie", 0700);
    WalFile_Open(&GlobalWal, WAL_PATH);
-   struct io_uring_params params;
-   memset((void*)&params, (int)0, sizeof(params));
-   params.flags = IORING_SETUP_SQPOLL;
-   params.sq_thread_idle = (unsigned int)2000;
-   int ret = io_uring_queue_init_params((unsigned int)1024, &ring, &params);
-   if (ret < 0) {
-      // Fallback for environments that restrict SQPOLL
-      params.flags &= ~(unsigned int)IORING_SETUP_SQPOLL;
-      ret = io_uring_queue_init_params((unsigned int)1024, &ring, &params);
-   }
-   g_ring_ok = (ret == 0);
    char paths[VAULT_PATH_LEN];
    memcpy(paths, VAULT_PATH, VAULT_PATH_LEN);
    uint16_t i = 0;
@@ -56,9 +43,6 @@ __attribute__((constructor)) void oopsie_init() {
    }
 }
 __attribute__((destructor)) void oopsie_cleanup() {
-   if (g_ring_ok) {
-      io_uring_queue_exit(&ring);
-   }
    WalFile_Close(&GlobalWal);
 }
 
@@ -88,7 +72,7 @@ int unlink(const char* path) {
    if (gnu_openat == NULL) {
       gnu_openat = (gnu_openat_t*)dlsym(RTLD_NEXT, "openat");
    }
-   if (strncmp(path, "/tmp/oopsie/", 12) == 0) {
+   if (is_ignored_path(path)) {
       return gnu_unlink(path);
    }
    if (!SHIM_SHOULD_MONITOR()) {
@@ -106,35 +90,7 @@ int unlink(const char* path) {
       WalFile_Append(&GlobalWal, path, &rec);
       char buffer[BUFFER_SZ];
       make_vault_path(buffer, stat_buf.st_ino);
-      int link_res = 0;
-      int unlink_res = 0;
-      if (g_ring_ok) {
-         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-         io_uring_prep_link(sqe, path, buffer, 0);
-         sqe->flags |= IOSQE_IO_LINK;
-         struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
-         io_uring_prep_unlink(sqe2, path, 0);
-         io_uring_submit(&ring);
-         struct io_uring_cqe* cqe = NULL;
-         struct io_uring_cqe* cqe2 = NULL;
-         while (io_uring_peek_cqe(&ring, &cqe) != (int)0) {
-            CPU_PAUSE();
-         }
-         link_res = cqe->res;
-         io_uring_cqe_seen(&ring, cqe);
-         while (io_uring_peek_cqe(&ring, &cqe2) != (int)0) {
-            CPU_PAUSE();
-         }
-         unlink_res = cqe2->res;
-         io_uring_cqe_seen(&ring, cqe2);
-      }
-      else {
-         link_res = link(path, buffer);
-         unlink_res = gnu_unlink(path);
-      }
-      if (link_res >= (int)0) {
-         return (unlink_res >= (int)0) ? (int)0 : (int)-1;
-      }
+      if (link(path, buffer) == 0) { return gnu_unlink(path); }
       int srcFd = gnu_open(path, O_RDONLY | O_CLOEXEC, 0600);
       if (srcFd < 0)
          return gnu_unlink(path);
@@ -164,7 +120,7 @@ int unlinkat(int dirfd, const char* path, int flags) {
    if (gnu_openat == NULL) {
       gnu_openat = (gnu_openat_t*)dlsym(RTLD_NEXT, "openat");
    }
-   if (strncmp(path, "/tmp/oopsie/", 12) == 0) {
+   if (is_ignored_path(path)) {
       return gnu_unlinkat(dirfd, path, flags);
    }
    if (!SHIM_SHOULD_MONITOR()) {
@@ -182,39 +138,7 @@ int unlinkat(int dirfd, const char* path, int flags) {
       WalFile_Append(&GlobalWal, path, &rec);
       char buffer[BUFFER_SZ];
       make_vault_path(buffer, stat_buf.st_ino);
-      int link_res = 0;
-      int unlink_res = 0;
-      if (g_ring_ok) {
-         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-         if (sqe) {
-            io_uring_prep_linkat(sqe, dirfd, path, AT_FDCWD, buffer, 0);
-            sqe->flags |= IOSQE_IO_LINK;
-            struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
-            if (sqe2) {
-               io_uring_prep_unlinkat(sqe2, dirfd, path, flags);
-               io_uring_submit(&ring);
-            }
-         }
-         struct io_uring_cqe* cqe = NULL;
-         struct io_uring_cqe* cqe2 = NULL;
-         while (io_uring_peek_cqe(&ring, &cqe) != 0) {
-            CPU_PAUSE();
-         }
-         link_res = cqe->res;
-         io_uring_cqe_seen(&ring, cqe);
-         while (io_uring_peek_cqe(&ring, &cqe2) != 0) {
-            CPU_PAUSE();
-         }
-         unlink_res = cqe2->res;
-         io_uring_cqe_seen(&ring, cqe2);
-      }
-      else {
-         link_res = linkat(dirfd, path, AT_FDCWD, buffer, 0);
-         unlink_res = gnu_unlinkat(dirfd, path, flags);
-      }
-      if (link_res >= 0) {
-         return (unlink_res >= 0) ? 0 : -1;
-      }
+      if (linkat(dirfd, path, AT_FDCWD, buffer, 0) == 0) { return gnu_unlinkat(dirfd, path, flags); }
       int cloneRes = (int)-1;
       int srcFd = gnu_openat(dirfd, path, O_RDONLY | O_CLOEXEC, 0600);
       if (srcFd < 0) {
@@ -248,7 +172,7 @@ int open(const char* pathname, int flags, ...) {
       mode = va_arg(args, mode_t);
       va_end(args);
    }
-   if (strncmp(pathname, "/tmp/oopsie/", 12) == (int)0) {
+   if (is_ignored_path(pathname)) {
       return gnu_open(pathname, flags, mode);
    }
    if (!SHIM_SHOULD_MONITOR()) {
@@ -317,7 +241,7 @@ int openat(int dirfd, const char* pathname, int flags, ...) {
       mode = va_arg(args, mode_t);
       va_end(args);
    }
-   if (strncmp(pathname, "/tmp/oopsie/", 12) == (int)0) {
+   if (is_ignored_path(pathname)) {
       return gnu_openat(dirfd, pathname, flags, mode);
    }
    if (!SHIM_SHOULD_MONITOR()) {
@@ -381,7 +305,7 @@ int rename(const char* oldpath, const char* newpath) {
    if (gnu_open == NULL) {
       gnu_open = (gnu_open_t*)dlsym(RTLD_NEXT, "open");
    }
-   if (strncmp(oldpath, "/tmp/oopsie/", 12) == 0 || strncmp(newpath, "/tmp/oopsie/", 12) == 0) {
+   if (is_ignored_path(oldpath) || is_ignored_path(newpath)) {
       return gnu_rename(oldpath, newpath);
    }
    if (!SHIM_SHOULD_MONITOR()) {
@@ -399,27 +323,7 @@ int rename(const char* oldpath, const char* newpath) {
       WalFile_Append(&GlobalWal, newpath, &rec_new);
       char buffer[BUFFER_SZ];
       make_vault_path(buffer, stat_buf.st_ino);
-      struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-      io_uring_prep_link(sqe, newpath, buffer, 0);
-      sqe->flags |= IOSQE_IO_LINK;
-      struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
-      io_uring_prep_rename(sqe2, oldpath, newpath);
-      io_uring_submit(&ring);
-      struct io_uring_cqe* cqe = NULL;
-      struct io_uring_cqe* cqe2 = NULL;
-      while (io_uring_peek_cqe(&ring, &cqe) != 0) {
-         CPU_PAUSE();
-      }
-      int link_res = cqe->res;
-      io_uring_cqe_seen(&ring, cqe);
-      while (io_uring_peek_cqe(&ring, &cqe2) != 0) {
-         CPU_PAUSE();
-      }
-      int rename_res = cqe2->res;
-      io_uring_cqe_seen(&ring, cqe2);
-      if (link_res >= 0) {
-         return (rename_res >= 0) ? 0 : -1;
-      }
+      if (link(newpath, buffer) == 0) { return gnu_rename(oldpath, newpath); }
       int srcFd = gnu_open(newpath, O_RDONLY | O_CLOEXEC, 0600);
       if (srcFd >= 0) {
          int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
@@ -464,7 +368,7 @@ int renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpat
    if (gnu_open == NULL) {
       gnu_open = (gnu_open_t*)dlsym(RTLD_NEXT, "open");
    }
-   if (strncmp(oldpath, "/tmp/oopsie/", 12) == 0 || strncmp(newpath, "/tmp/oopsie/", 12) == 0) {
+   if (is_ignored_path(oldpath) || is_ignored_path(newpath)) {
       return gnu_renameat(olddirfd, oldpath, newdirfd, newpath);
    }
    if (!SHIM_SHOULD_MONITOR()) {
@@ -482,27 +386,7 @@ int renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpat
       WalFile_Append(&GlobalWal, newpath, &rec_new);
       char buffer[BUFFER_SZ];
       make_vault_path(buffer, stat_buf.st_ino);
-      struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-      io_uring_prep_linkat(sqe, newdirfd, newpath, AT_FDCWD, buffer, (int)0);
-      sqe->flags |= IOSQE_IO_LINK;
-      struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
-      io_uring_prep_renameat(sqe2, olddirfd, oldpath, newdirfd, newpath, 0);
-      io_uring_submit(&ring);
-      struct io_uring_cqe* cqe = NULL;
-      struct io_uring_cqe* cqe2 = NULL;
-      while (io_uring_peek_cqe(&ring, &cqe) != 0) {
-         CPU_PAUSE();
-      }
-      int link_res = cqe->res;
-      io_uring_cqe_seen(&ring, cqe);
-      while (io_uring_peek_cqe(&ring, &cqe2) != 0) {
-         CPU_PAUSE();
-      }
-      int rename_res = cqe2->res;
-      io_uring_cqe_seen(&ring, cqe2);
-      if (link_res >= 0) {
-         return (rename_res >= 0) ? 0 : -1;
-      }
+      if (link(newpath, buffer) == 0) { return gnu_rename(oldpath, newpath); }
       int srcFd = gnu_openat(newdirfd, newpath, O_RDONLY | O_CLOEXEC, 0600);
       if (srcFd >= 0) {
          int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
@@ -548,7 +432,7 @@ int renameat2(int olddirfd, const char* oldpath, int newdirfd, const char* newpa
    if (gnu_open == NULL) {
       gnu_open = (gnu_open_t*)dlsym(RTLD_NEXT, "open");
    }
-   if (strncmp(oldpath, "/tmp/oopsie/", 12) == 0 || strncmp(newpath, "/tmp/oopsie/", 12) == 0) {
+   if (is_ignored_path(oldpath) || is_ignored_path(newpath)) {
       return gnu_renameat2(olddirfd, oldpath, newdirfd, newpath, flags);
    }
    if (!SHIM_SHOULD_MONITOR()) {
@@ -565,27 +449,7 @@ int renameat2(int olddirfd, const char* oldpath, int newdirfd, const char* newpa
       WalFile_Append(&GlobalWal, newpath, &rec_new);
       char buffer[BUFFER_SZ];
       make_vault_path(buffer, stat_buf.st_ino);
-      struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-      io_uring_prep_linkat(sqe, newdirfd, newpath, AT_FDCWD, buffer, (int)0);
-      sqe->flags |= IOSQE_IO_LINK;
-      struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
-      io_uring_prep_renameat(sqe2, olddirfd, oldpath, newdirfd, newpath, flags);
-      io_uring_submit(&ring);
-      struct io_uring_cqe* cqe = NULL;
-      struct io_uring_cqe* cqe2 = NULL;
-      while (io_uring_peek_cqe(&ring, &cqe) != 0) {
-         CPU_PAUSE();
-      }
-      int link_res = cqe->res;
-      io_uring_cqe_seen(&ring, cqe);
-      while (io_uring_peek_cqe(&ring, &cqe2) != 0) {
-         CPU_PAUSE();
-      }
-      int rename_res = cqe2->res;
-      io_uring_cqe_seen(&ring, cqe2);
-      if (link_res >= 0) {
-         return (rename_res >= 0) ? 0 : -1;
-      }
+      if (link(newpath, buffer) == 0) { return gnu_rename(oldpath, newpath); }
       int srcFd = gnu_openat(newdirfd, newpath, O_RDONLY | O_CLOEXEC, 0600);
       if (srcFd >= 0) {
          int destFd = gnu_open(buffer, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);

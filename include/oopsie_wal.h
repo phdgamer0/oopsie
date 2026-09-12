@@ -40,6 +40,7 @@ typedef struct {
    uint32_t is_monitoring;
    uint64_t current_offset;
    uint32_t toombstone;
+   uint64_t start_time;
 } WalHeader;
 #pragma pack(pop)
 

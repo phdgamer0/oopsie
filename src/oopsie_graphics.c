@@ -201,7 +201,7 @@ void oopsie_graphics_set_exit_key(uint16_t key) {
 }
 
 bool oopsie_graphics_is_key_pressed(uint16_t key) {
-   return (bool)(ev.type == TB_EVENT_KEY && ev.key == key);
+   return (bool)(ev.type == TB_EVENT_KEY && (ev.key == key || ev.ch == key));
 }
 
 // MOUSE

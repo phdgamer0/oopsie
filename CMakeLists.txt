@@ -35,7 +35,7 @@ file(COPY "${termbox2_SOURCE_DIR}/termbox2.h" DESTINATION "${TERMBOX2_INCLUDE_DI
 
 add_library(oopsie_graphics STATIC src/oopsie_graphics.c)
 target_include_directories(oopsie_graphics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_include_directories(oopsie_graphics PRIVATE ${termbox2_SOURCE_DIR})
+target_include_directories(oopsie_graphics PUBLIC ${termbox2_SOURCE_DIR})
 target_compile_options(oopsie_graphics PRIVATE -O3 -Wall -Wextra -std=c2x)
 
 # Main CLI Application
