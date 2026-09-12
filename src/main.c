@@ -1,5 +1,9 @@
 #define _GNU_SOURCE
 #include <bits/types/timer_t.h>
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <fnmatch.h>
 #include <oopsie_graphics.h>
 #include <oopsie_wal.h>
 #include <signal.h>
@@ -11,13 +15,224 @@
 #include <termbox2.h>
 #include <time.h>
 #include <unistd.h>
-
 #define VIEW_SZ (size_t)500
 
 volatile sig_atomic_t keep_running = 1;
 static const char* row1 = "░░█▀█░█▀█░█▀█░█▀▀░▀█▀░█▀▀░█░█░░";
 static const char* row2 = "░░█░█░█░█░█▀▀░▀▀█░░█░░█▀▀░█░█░░";
 static const char* row3 = "░░▀▀▀░▀▀▀░▀░░░▀▀▀░▀▀▀░▀▀▀░▄░▄░░";
+
+typedef enum {
+   SORT_TIME = 0,
+   SORT_ACTION,
+   SORT_PATH
+} sort_mode_t;
+static sort_mode_t g_current_sort = SORT_TIME;
+static bool g_sort_descending = true;
+
+int compare_views(const void* a, const void* b) {
+   const OopWalRecordView* va = (const OopWalRecordView*)a;
+   const OopWalRecordView* vb = (const OopWalRecordView*)b;
+   int cmp = 0;
+   switch (g_current_sort) {
+   case SORT_TIME:
+      if (va->rec->timestamp < vb->rec->timestamp)
+         cmp = -1;
+      else if (va->rec->timestamp > vb->rec->timestamp)
+         cmp = 1;
+      break;
+   case SORT_ACTION:
+      if (va->rec->action < vb->rec->action)
+         cmp = -1;
+      else if (va->rec->action > vb->rec->action)
+         cmp = 1;
+      break;
+   case SORT_PATH: {
+      size_t min_len = va->rec->pathlen < vb->rec->pathlen ? va->rec->pathlen : vb->rec->pathlen;
+      cmp = memcmp(va->path, vb->path, min_len);
+      if (cmp == 0) {
+         if (va->rec->pathlen < vb->rec->pathlen)
+            cmp = -1;
+         else if (va->rec->pathlen > vb->rec->pathlen)
+            cmp = 1;
+      }
+      break;
+   }
+   }
+   if (cmp == 0 && g_current_sort != SORT_TIME) {
+      if (va->rec->timestamp < vb->rec->timestamp)
+         cmp = -1;
+      else if (va->rec->timestamp > vb->rec->timestamp)
+         cmp = 1;
+   }
+   return g_sort_descending ? -cmp : cmp;
+}
+
+typedef struct {
+   OopWalRecordView v;
+   size_t abs_idx;
+} LsView;
+
+int compare_ls_views(const void* a, const void* b) {
+   const LsView* la = (const LsView*)a;
+   const LsView* lb = (const LsView*)b;
+   return compare_views(&la->v, &lb->v);
+}
+
+bool do_restore(OopWalRecordView* view) {
+   bool success = false;
+   if (view->rec->action == OopAction_DELETE || view->rec->action == OopAction_MODIFY) {
+      char vault_path[128];
+      make_vault_path(vault_path, view->rec->inode);
+      char target_path[512];
+      size_t len = view->rec->pathlen;
+      if (len >= sizeof(target_path))
+         len = sizeof(target_path) - 1;
+      memcpy(target_path, view->path, len);
+      target_path[len] = '\0';
+      int srcFd = open(vault_path, O_RDONLY);
+      if (srcFd >= 0) {
+         int destFd = open(target_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+         if (destFd >= 0) {
+            char buf[4096];
+            ssize_t bytes;
+            while ((bytes = read(srcFd, buf, sizeof(buf))) > 0) {
+               write(destFd, buf, bytes);
+            }
+            close(destFd);
+            success = true;
+         }
+         close(srcFd);
+      }
+   }
+   else if (view->rec->action == OopAction_RENAME) {
+      char old_path[512];
+      char new_path[512];
+      size_t old_len = strlen(view->path);
+      if (old_len < view->rec->pathlen) {
+         strcpy(old_path, view->path);
+         strcpy(new_path, view->path + old_len + 1);
+         if (rename(new_path, old_path) == 0) {
+            success = true;
+         }
+      }
+   }
+   else if (view->rec->action == OopAction_CREATE) {
+      char target_path[512];
+      size_t len = view->rec->pathlen;
+      if (len >= sizeof(target_path))
+         len = sizeof(target_path) - 1;
+      memcpy(target_path, view->path, len);
+      target_path[len] = '\0';
+
+      // Restoring a file creation means undoing it (deleting the file)
+      if (unlink(target_path) == 0) {
+         success = true;
+      }
+      else {
+         // If it's already deleted, consider it successfully undone
+         if (errno == ENOENT) {
+            success = true;
+         }
+      }
+   }
+   return success;
+}
+
+bool parse_indices(const char* str, size_t* indices, size_t* num_indices) {
+   char* s = strdup(str);
+   char* tok = strtok(s, ",");
+   *num_indices = 0;
+   while (tok) {
+      // trim spaces
+      while (isspace(*tok))
+         tok++;
+      char* dash = strchr(tok, '-');
+      if (dash) {
+         *dash = '\0';
+         char* endptr1;
+         char* endptr2;
+         long start = strtol(tok, &endptr1, 10);
+         long end = strtol(dash + 1, &endptr2, 10);
+         while (isspace(*endptr1))
+            endptr1++;
+         while (isspace(*endptr2))
+            endptr2++;
+         if (start < 0 || end < 0 || start > end || *endptr1 != '\0' || *endptr2 != '\0') {
+            free(s);
+            return false;
+         }
+         for (long i = start; i <= end; i++) {
+            indices[(*num_indices)++] = (size_t)i;
+         }
+      }
+      else {
+         char* endptr;
+         long val = strtol(tok, &endptr, 10);
+         while (isspace(*endptr))
+            endptr++;
+         if (val < 0 || *endptr != '\0') {
+            free(s);
+            return false;
+         }
+         indices[(*num_indices)++] = (size_t)val;
+      }
+      tok = strtok(NULL, ",");
+   }
+   free(s);
+   return true;
+}
+
+bool prompt_and_restore(OopWalContext* wal, LsView* view, bool silent) {
+   if (!silent) {
+      struct tm* t = localtime((const time_t*)&view->v.rec->timestamp);
+      char time_str[64];
+      strftime(time_str, sizeof(time_str), "[%d-%m-%Y %H:%M:%S]", t);
+      const char* action_str = "UNKNOWN";
+      switch (view->v.rec->action) {
+      case OopAction_DELETE:
+         action_str = "DELETE";
+         break;
+      case OopAction_CREATE:
+         action_str = "CREATE";
+         break;
+      case OopAction_MODIFY:
+         action_str = "MODIFY";
+         break;
+      case OopAction_RENAME:
+         action_str = "RENAME";
+         break;
+      }
+      char disp_path[1024];
+      size_t plen = view->v.rec->pathlen;
+      if (plen >= sizeof(disp_path))
+         plen = sizeof(disp_path) - 1;
+      memcpy(disp_path, view->v.path, plen);
+      disp_path[plen] = '\0';
+      printf("Index: %zu\nTime: %s\nAction: %s\nPath: %s\n", view->abs_idx, time_str, action_str, disp_path);
+      printf("Restore this item? [y/N]: ");
+      fflush(stdout);
+      char answer[16];
+      if (!fgets(answer, sizeof(answer), stdin))
+         return false;
+      if (answer[0] != 'y' && answer[0] != 'Y') {
+         printf("Skipped.\n");
+         return false;
+      }
+   }
+
+   if (do_restore(&view->v)) {
+      WalFile_Purge(wal, &view->v);
+      if (!silent)
+         printf("Successfully restored.\n");
+      return true;
+   }
+   else {
+      if (!silent)
+         printf("Failed to restore.\n");
+      return false;
+   }
+}
 
 void handle_args(int argc, char* argv[]) {
    if (argc > 1) {
@@ -27,33 +242,44 @@ void handle_args(int argc, char* argv[]) {
             ushell = "sh";
          OopWalContext wal;
          mkdir("/tmp/oopsie", 0700);
+         bool already_in_shell = (getenv("OOPSIE_SHIM_ACTIVE") != NULL);
          if (WalFile_Open(&wal, WAL_PATH)) {
             WalHeader* header = (WalHeader*)wal.map;
             if (__atomic_load_n(&header->is_monitoring, __ATOMIC_RELAXED) == 1) {
                printf("[Oopsie] Already monitoring!\n");
+               WalFile_Close(&wal);
+               if (already_in_shell)
+                  exit(0);
             }
             else {
                __atomic_store_n(&header->is_monitoring, 1, __ATOMIC_RELAXED);
                __atomic_store_n(&header->start_time, (uint64_t)time(NULL), __ATOMIC_RELAXED);
-            }
-            WalFile_Close(&wal);
-         }
-         char shim_path[512] = {0};
-         char exe_path[512] = {0};
-         ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-         if (len != -1) {
-            exe_path[len] = '\0';
-            char* last_slash = strrchr(exe_path, '/');
-            if (last_slash) {
-               *last_slash = '\0';
-               snprintf(shim_path, sizeof(shim_path), "%s/liboopsie_shim.so", exe_path);
+               WalFile_Close(&wal);
+               if (already_in_shell) {
+                  printf("[Oopsie] Monitoring resumed.\n");
+                  exit(0);
+               }
             }
          }
-         setenv("LD_PRELOAD", shim_path, 1);
-         printf("[Oopsie] Starting monitored shell... Type 'exit' to end.\n");
-         execlp(ushell, ushell, NULL);
-         perror("execlp");
-         exit(1);
+         if (!already_in_shell) {
+            char shim_path[512] = {0};
+            char exe_path[512] = {0};
+            ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+            if (len != -1) {
+               exe_path[len] = '\0';
+               char* last_slash = strrchr(exe_path, '/');
+               if (last_slash) {
+                  *last_slash = '\0';
+                  snprintf(shim_path, sizeof(shim_path), "%s/liboopsie_shim.so", exe_path);
+               }
+            }
+            setenv("LD_PRELOAD", shim_path, 1);
+            setenv("OOPSIE_SHIM_ACTIVE", "1", 1);
+            printf("[Oopsie] Starting monitored shell... Type 'exit' to end.\n");
+            execlp(ushell, ushell, NULL);
+            perror("execlp");
+            exit(1);
+         }
       }
       else if (strcmp(argv[1], "end") == 0) {
          OopWalContext wal;
@@ -77,6 +303,468 @@ void handle_args(int argc, char* argv[]) {
       else if (strcmp(argv[1], "uninstall") == 0) {
          system("rm -rf /tmp/oopsie");
          printf("[Oopsie] Vault uninstalled from /tmp/oopsie\n");
+         exit(0);
+      }
+      else if (strcmp(argv[1], "ls") == 0) {
+         // flags:
+         // -c --colored,
+         // -s --sort [action|path|time] (desc),
+         // -S --Sort [action|path|time] (asc),
+         // -l --limit [N] (shows N results from the top)
+         // -L --Limit [N] (shows N results from bottom)
+         // -n --numbered (shows indexes for piping to awk) (active by default)
+         // -N --Numbered (relative to the shown file) (use this if you wanna purge or restore by index)
+         // -a --action (does not show action)
+         // -t --time (does not show time)
+         // -p --path (does not show path)
+         // -o --output (faster redirection than > or >>)
+
+         bool opt_colored = false;
+         bool opt_num_abs = true;
+         bool opt_num_rel = false;
+         bool opt_show_action = true;
+         bool opt_show_time = true;
+         bool opt_show_path = true;
+         size_t opt_limit_top = 0;
+         size_t opt_limit_bottom = 0;
+         const char* opt_output = NULL;
+
+         for (int i = 2; i < argc; i++) {
+            if (argv[i][0] == '-') {
+               if (argv[i][1] == '-') {
+                  if (strcmp(argv[i], "--colored") == 0)
+                     opt_colored = true;
+                  else if (strcmp(argv[i], "--numbered") == 0)
+                     opt_num_abs = true;
+                  else if (strcmp(argv[i], "--Numbered") == 0)
+                     opt_num_rel = true;
+                  else if (strcmp(argv[i], "--action") == 0)
+                     opt_show_action = false;
+                  else if (strcmp(argv[i], "--time") == 0)
+                     opt_show_time = false;
+                  else if (strcmp(argv[i], "--path") == 0)
+                     opt_show_path = false;
+                  else if (strcmp(argv[i], "--sort") == 0 || strcmp(argv[i], "--Sort") == 0) {
+                     bool asc = (strcmp(argv[i], "--Sort") == 0);
+                     i++;
+                     if (i >= argc) {
+                        printf("Invalid option\n");
+                        exit(1);
+                     }
+                     if (strcmp(argv[i], "time") == 0)
+                        g_current_sort = SORT_TIME;
+                     else if (strcmp(argv[i], "action") == 0)
+                        g_current_sort = SORT_ACTION;
+                     else if (strcmp(argv[i], "path") == 0)
+                        g_current_sort = SORT_PATH;
+                     else {
+                        printf("Invalid flag or option\n");
+                        exit(1);
+                     }
+                     g_sort_descending = !asc;
+                  }
+                  else if (strcmp(argv[i], "--limit") == 0 || strcmp(argv[i], "--Limit") == 0) {
+                     bool top = (strcmp(argv[i], "--limit") == 0);
+                     i++;
+                     if (i >= argc) {
+                        printf("Invalid option\n");
+                        exit(1);
+                     }
+                     if (top)
+                        opt_limit_top = (size_t)atoi(argv[i]);
+                     else
+                        opt_limit_bottom = (size_t)atoi(argv[i]);
+                  }
+                  else if (strcmp(argv[i], "--output") == 0) {
+                     i++;
+                     if (i >= argc) {
+                        printf("Invalid option\n");
+                        exit(1);
+                     }
+                     opt_output = argv[i];
+                  }
+                  else {
+                     printf("Invalid flag or option\n");
+                     exit(1);
+                  }
+               }
+               else {
+                  for (size_t j = 1; argv[i][j] != '\0'; j++) {
+                     char c = argv[i][j];
+                     if (c == 'c')
+                        opt_colored = true;
+                     else if (c == 'n')
+                        opt_num_abs = true;
+                     else if (c == 'N') {
+                        opt_num_rel = true;
+                        opt_num_abs = false;
+                     }
+                     else if (c == 'a')
+                        opt_show_action = false;
+                     else if (c == 't')
+                        opt_show_time = false;
+                     else if (c == 'p')
+                        opt_show_path = false;
+                     else if (c == 's' || c == 'S' || c == 'l' || c == 'L' || c == 'o') {
+                        i++;
+                        if (i >= argc) {
+                           printf("Invalid option\n");
+                           exit(1);
+                        }
+                        if (c == 's' || c == 'S') {
+                           if (strcmp(argv[i], "time") == 0)
+                              g_current_sort = SORT_TIME;
+                           else if (strcmp(argv[i], "action") == 0)
+                              g_current_sort = SORT_ACTION;
+                           else if (strcmp(argv[i], "path") == 0)
+                              g_current_sort = SORT_PATH;
+                           else {
+                              printf("Invalid flag or option\n");
+                              exit(1);
+                           }
+                           g_sort_descending = (c == 's');
+                        }
+                        else if (c == 'l') {
+                           opt_limit_top = (size_t)atoi(argv[i]);
+                        }
+                        else if (c == 'L') {
+                           opt_limit_bottom = (size_t)atoi(argv[i]);
+                        }
+                        else if (c == 'o') {
+                           opt_output = argv[i];
+                        }
+                        break;
+                     }
+                     else {
+                        printf("Invalid flag or option\n");
+                        exit(1);
+                     }
+                  }
+               }
+            }
+            else {
+               printf("Invalid flag or option\n");
+               exit(1);
+            }
+         }
+
+         OopWalContext wal;
+         if (!WalFile_Open(&wal, "/tmp/oopsie/vault.wal")) {
+            printf("[Oopsie] Failed to open WAL.\n");
+            exit(1);
+         }
+
+         OopWalRecordView temp_views[VIEW_SZ];
+         size_t fsize = WalFile_Parse(&wal, temp_views, VIEW_SZ);
+
+         LsView ls_views[VIEW_SZ];
+         for (size_t i = 0; i < fsize; i++) {
+            ls_views[i].v = temp_views[i];
+            ls_views[i].abs_idx = i;
+         }
+
+         if (fsize > 0) {
+            qsort(ls_views, fsize, sizeof(LsView), compare_ls_views);
+         }
+
+         FILE* out = stdout;
+         if (opt_output) {
+            out = fopen(opt_output, "w");
+            if (!out) {
+               printf("Failed to open output file: %s\n", opt_output);
+               exit(1);
+            }
+            opt_colored = false;
+         }
+
+         size_t start1 = 0, end1 = fsize;
+         size_t start2 = fsize, end2 = fsize;
+         if (opt_limit_top > 0 || opt_limit_bottom > 0) {
+            if (opt_limit_top > 0)
+               end1 = (opt_limit_top < fsize) ? opt_limit_top : fsize;
+            else
+               end1 = 0;
+            if (opt_limit_bottom > 0)
+               start2 = (fsize > opt_limit_bottom) ? fsize - opt_limit_bottom : 0;
+            if (end1 > start2)
+               start2 = end1;
+         }
+
+         size_t rel_idx = 1;
+         for (size_t i = 0; i < fsize; i++) {
+            if (!((i >= start1 && i < end1) || (i >= start2 && i < end2)))
+               continue;
+
+            if (opt_num_abs)
+               fprintf(out, "%-4zu ", ls_views[i].abs_idx);
+            if (opt_num_rel)
+               fprintf(out, "%-4zu ", rel_idx++);
+
+            if (opt_show_time) {
+               struct tm* t = localtime((const time_t*)&ls_views[i].v.rec->timestamp);
+               char time_str[64];
+               strftime(time_str, sizeof(time_str), "[%d-%m-%Y %H:%M:%S]", t);
+               fprintf(out, "%s ", time_str);
+            }
+            if (opt_show_action) {
+               const char* action_str = "UNKNOWN";
+               const char* color_code = "";
+               if (opt_colored) {
+                  switch (ls_views[i].v.rec->action) {
+                  case OopAction_DELETE:
+                     color_code = "\x1b[38;2;230;41;55m";
+                     break;
+                  case OopAction_CREATE:
+                     color_code = "\x1b[38;2;0;228;48m";
+                     break;
+                  case OopAction_MODIFY:
+                     color_code = "\x1b[38;2;253;249;0m";
+                     break;
+                  case OopAction_RENAME:
+                     color_code = "\x1b[38;2;255;161;0m";
+                     break;
+                  }
+               }
+               switch (ls_views[i].v.rec->action) {
+               case OopAction_DELETE:
+                  action_str = "DELETE";
+                  break;
+               case OopAction_CREATE:
+                  action_str = "CREATE";
+                  break;
+               case OopAction_MODIFY:
+                  action_str = "MODIFY";
+                  break;
+               case OopAction_RENAME:
+                  action_str = "RENAME";
+                  break;
+               }
+               if (opt_colored)
+                  fprintf(out, "%s%-7s\x1b[0m ", color_code, action_str);
+               else
+                  fprintf(out, "%-7s ", action_str);
+            }
+            if (opt_show_path) {
+               char disp_path[1024];
+               size_t plen = ls_views[i].v.rec->pathlen;
+               if (plen >= sizeof(disp_path))
+                  plen = sizeof(disp_path) - 1;
+               memcpy(disp_path, ls_views[i].v.path, plen);
+               disp_path[plen] = '\0';
+               fprintf(out, "%s", disp_path);
+            }
+            fprintf(out, "\n");
+         }
+
+         if (out != stdout)
+            fclose(out);
+         WalFile_Close(&wal);
+         exit(0);
+      }
+      else if (strcmp(argv[1], "restore") == 0) {
+         bool opt_silent = false;
+         char* opt_number = NULL;
+         char* opt_path = NULL;
+
+         for (int i = 2; i < argc; i++) {
+            if (argv[i][0] == '-') {
+               if (argv[i][1] == '-') {
+                  if (strcmp(argv[i], "--silent") == 0)
+                     opt_silent = true;
+                  else if (strcmp(argv[i], "--number") == 0) {
+                     i++;
+                     if (i >= argc) {
+                        printf("Invalid flag or option\n");
+                        exit(1);
+                     }
+                     opt_number = argv[i];
+                  }
+                  else if (strcmp(argv[i], "--path") == 0) {
+                     i++;
+                     if (i >= argc) {
+                        printf("Invalid flag or option\n");
+                        exit(1);
+                     }
+                     opt_path = argv[i];
+                  }
+                  else {
+                     printf("Invalid flag or option\n");
+                     exit(1);
+                  }
+               }
+               else {
+                  for (size_t j = 1; argv[i][j] != '\0'; j++) {
+                     char c = argv[i][j];
+                     if (c == 's')
+                        opt_silent = true;
+                     else if (c == 'n' || c == 'p') {
+                        i++;
+                        if (i >= argc) {
+                           printf("Invalid flag or option\n");
+                           exit(1);
+                        }
+                        if (c == 'n')
+                           opt_number = argv[i];
+                        else if (c == 'p')
+                           opt_path = argv[i];
+                        break;
+                     }
+                     else {
+                        printf("Invalid flag or option\n");
+                        exit(1);
+                     }
+                  }
+               }
+            }
+            else {
+               printf("Invalid flag or option\n");
+               exit(1);
+            }
+         }
+
+         OopWalContext wal;
+         if (!WalFile_Open(&wal, "/tmp/oopsie/vault.wal")) {
+            printf("[Oopsie] Failed to open WAL.\n");
+            exit(1);
+         }
+
+         // Pause monitoring so our restorations aren't intercepted by shim!
+         WalHeader* header = (WalHeader*)wal.map;
+         uint32_t was_monitoring = __atomic_load_n(&header->is_monitoring, __ATOMIC_RELAXED);
+         if (was_monitoring) {
+            __atomic_store_n(&header->is_monitoring, 0, __ATOMIC_RELAXED);
+         }
+
+         OopWalRecordView temp_views[VIEW_SZ];
+         size_t fsize = WalFile_Parse(&wal, temp_views, VIEW_SZ);
+
+         LsView ls_views[VIEW_SZ];
+         for (size_t i = 0; i < fsize; i++) {
+            ls_views[i].v = temp_views[i];
+            ls_views[i].abs_idx = i;
+         }
+
+         bool did_restore = false;
+         bool any_failed = false;
+
+         if (opt_path) {
+            LsView matched[VIEW_SZ];
+            size_t m_count = 0;
+            for (size_t i = 0; i < fsize; i++) {
+               char disp_path[1024];
+               size_t plen = ls_views[i].v.rec->pathlen;
+               if (plen >= sizeof(disp_path))
+                  plen = sizeof(disp_path) - 1;
+               memcpy(disp_path, ls_views[i].v.path, plen);
+               disp_path[plen] = '\0';
+               if (fnmatch(opt_path, disp_path, 0) == 0) {
+                  matched[m_count++] = ls_views[i];
+               }
+            }
+            if (m_count == 0) {
+               printf("No matches found for path %s\n", opt_path);
+               WalFile_Close(&wal);
+               exit(1);
+            }
+            g_current_sort = SORT_TIME;
+            g_sort_descending = true;
+            qsort(matched, m_count, sizeof(LsView), compare_ls_views);
+
+            if (opt_silent) {
+               if (do_restore(&matched[0].v)) {
+                  WalFile_Purge(&wal, &matched[0].v);
+                  did_restore = true;
+               }
+               else {
+                  any_failed = true;
+               }
+            }
+            else {
+               for (size_t i = 0; i < m_count; i++) {
+                  struct tm* t = localtime((const time_t*)&matched[i].v.rec->timestamp);
+                  char time_str[64];
+                  strftime(time_str, sizeof(time_str), "[%d-%m-%Y %H:%M:%S]", t);
+                  char disp_path[1024];
+                  size_t plen = matched[i].v.rec->pathlen;
+                  if (plen >= sizeof(disp_path))
+                     plen = sizeof(disp_path) - 1;
+                  memcpy(disp_path, matched[i].v.path, plen);
+                  disp_path[plen] = '\0';
+                  printf("%-4zu %s %s\n", matched[i].abs_idx, time_str, disp_path);
+               }
+               printf("Enter indices to restore (e.g. 1,3-5,7): ");
+               fflush(stdout);
+               char input_buf[256];
+               if (fgets(input_buf, sizeof(input_buf), stdin)) {
+                  input_buf[strcspn(input_buf, "\n")] = '\0';
+                  size_t indices[1024];
+                  size_t num_indices = 0;
+                  if (!parse_indices(input_buf, indices, &num_indices)) {
+                     printf("Invalid indices format\n");
+                     WalFile_Close(&wal);
+                     exit(1);
+                  }
+                  for (size_t i = 0; i < num_indices; i++) {
+                     size_t idx = indices[i];
+                     if (idx >= fsize) {
+                        printf("Index %zu out of bounds\n", idx);
+                        WalFile_Close(&wal);
+                        exit(1);
+                     }
+                     if (prompt_and_restore(&wal, &ls_views[idx], false))
+                        did_restore = true;
+                  }
+               }
+            }
+         }
+         else if (opt_number) {
+            size_t indices[1024];
+            size_t num_indices = 0;
+            if (!parse_indices(opt_number, indices, &num_indices)) {
+               printf("Invalid flag or option\n");
+               WalFile_Close(&wal);
+               exit(1);
+            }
+            for (size_t i = 0; i < num_indices; i++) {
+               size_t idx = indices[i];
+               if (idx >= fsize) {
+                  printf("Index %zu out of bounds\n", idx);
+                  WalFile_Close(&wal);
+                  exit(1);
+               }
+               bool res = prompt_and_restore(&wal, &ls_views[idx], opt_silent);
+               if (res)
+                  did_restore = true;
+               else if (opt_silent)
+                  any_failed = true;
+            }
+         }
+         else {
+            if (fsize == 0) {
+               printf("No events to restore.\n");
+               WalFile_Close(&wal);
+               exit(1);
+            }
+            g_current_sort = SORT_TIME;
+            g_sort_descending = true;
+            qsort(ls_views, fsize, sizeof(LsView), compare_ls_views);
+
+            bool res = prompt_and_restore(&wal, &ls_views[0], opt_silent);
+            if (res)
+               did_restore = true;
+            else if (opt_silent)
+               any_failed = true;
+         }
+
+         if (did_restore) {
+            WalFile_Compact(&wal);
+         }
+         if (was_monitoring) {
+            __atomic_store_n(&header->is_monitoring, 1, __ATOMIC_RELAXED);
+         }
+         WalFile_Close(&wal);
+         if (opt_silent && any_failed)
+            exit(1);
          exit(0);
       }
       else {
@@ -159,6 +847,9 @@ int main(int argc, char* argv[]) {
          }
          if (selected_index >= fsize)
             selected_index = (size_t)-1;
+         if (fsize > 0) {
+            qsort(views, fsize, sizeof(OopWalRecordView), compare_views);
+         }
       }
       size_t old_fsize = log_scrollbar.total_items;
       log_scrollbar.total_items = fsize;
@@ -181,38 +872,8 @@ int main(int argc, char* argv[]) {
       if (!search_box.is_focused && (oopsie_graphics_is_key_pressed('r') || oopsie_graphics_is_key_pressed('R'))) {
          if (wal_is_open && selected_index < fsize) {
             OopWalRecordView* view = &views[selected_index];
-            if (view->rec->action == OopAction_DELETE || view->rec->action == OopAction_MODIFY) {
-               char vault_path[128];
-               make_vault_path(vault_path, view->rec->inode);
-               char target_path[512];
-               size_t len = view->rec->pathlen;
-               if (len >= sizeof(target_path))
-                  len = sizeof(target_path) - 1;
-               memcpy(target_path, view->path, len);
-               target_path[len] = '\0';
-               int srcFd = open(vault_path, O_RDONLY);
-               if (srcFd >= 0) {
-                  int destFd = open(target_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-                  if (destFd >= 0) {
-                     char buf[4096];
-                     ssize_t bytes;
-                     while ((bytes = read(srcFd, buf, sizeof(buf))) > 0) {
-                        write(destFd, buf, bytes);
-                     }
-                     close(destFd);
-                  }
-                  close(srcFd);
-               }
-            }
-            else if (view->rec->action == OopAction_RENAME) {
-               char old_path[512];
-               char new_path[512];
-               size_t old_len = strlen(view->path);
-               if (old_len < view->rec->pathlen) {
-                  strcpy(old_path, view->path);
-                  strcpy(new_path, view->path + old_len + 1);
-                  rename(new_path, old_path);
-               }
+            if (do_restore(view)) {
+               // Success
             }
             WalFile_Purge(&wal, view);
             WalFile_Compact(&wal);
@@ -253,6 +914,15 @@ int main(int argc, char* argv[]) {
             log_scrollbar.current_scroll = 0;
          }
       }
+      if (!search_box.is_focused && (oopsie_graphics_is_key_pressed('l') || oopsie_graphics_is_key_pressed('L'))) {
+         g_current_sort = (sort_mode_t)((g_current_sort + 1) % 3);
+      }
+      if (!search_box.is_focused && (oopsie_graphics_is_key_pressed('h') || oopsie_graphics_is_key_pressed('H'))) {
+         g_current_sort = (sort_mode_t)((g_current_sort - 1) % 3);
+      }
+      if (!search_box.is_focused && (oopsie_graphics_is_key_pressed('t') || oopsie_graphics_is_key_pressed('T'))) {
+         g_sort_descending = !g_sort_descending;
+      }
       if (!search_box.is_focused && (oopsie_graphics_is_key_pressed('p') || oopsie_graphics_is_key_pressed('P'))) {
          if (wal_is_open) {
             for (size_t i = 0; i < fsize; i++) {
@@ -275,7 +945,6 @@ int main(int argc, char* argv[]) {
 
       if (!search_box.is_focused && oopsie_graphics_is_key_pressed('/')) {
          search_box.is_focused = 1;
-         search_box.buffer[strlen(search_box.buffer) - 1] = '\0';
       }
       if (search_box.is_focused && oopsie_graphics_is_key_pressed(TB_KEY_TAB)) {
          search_box.is_focused = 0;
@@ -285,7 +954,31 @@ int main(int argc, char* argv[]) {
          uint16_t sb_width = 35;
          uint16_t sb_x = ScreenWH.x > sb_width ? ScreenWH.x - sb_width : 0;
          uint16_t log_width = sb_x > 2 ? sb_x - 1 : 0;
-         if (mpos.x >= 2 && mpos.x < log_width - 2 && mpos.y >= 6 && mpos.y < 6 + log_scrollbar.visible_items) {
+         if (oopsie_graphics_is_mouse_in_rect(RECT(2, 4, 10, 1))) {
+            if (g_current_sort == SORT_TIME)
+               g_sort_descending = !g_sort_descending;
+            else {
+               g_current_sort = SORT_TIME;
+               g_sort_descending = true;
+            }
+         }
+         else if (oopsie_graphics_is_mouse_in_rect(RECT(27, 4, 8, 1))) {
+            if (g_current_sort == SORT_ACTION)
+               g_sort_descending = !g_sort_descending;
+            else {
+               g_current_sort = SORT_ACTION;
+               g_sort_descending = true;
+            }
+         }
+         else if (oopsie_graphics_is_mouse_in_rect(RECT(37, 4, 6, 1))) {
+            if (g_current_sort == SORT_PATH)
+               g_sort_descending = !g_sort_descending;
+            else {
+               g_current_sort = SORT_PATH;
+               g_sort_descending = true;
+            }
+         }
+         else if (oopsie_graphics_is_mouse_in_rect(RECT(2, 6, log_width - 4, log_scrollbar.visible_items))) {
             size_t clicked_index = log_scrollbar.current_scroll + (mpos.y - 6);
             if (clicked_index < fsize) {
                selected_index = clicked_index;
@@ -321,7 +1014,21 @@ int main(int argc, char* argv[]) {
          oopsie_graphics_draw_string(POINT(2, 2), "/search: ", YELLOW, BLACK);
          oopsie_ui_draw_textbox(&search_box, GRAY, DARKGRAY, WHITE);
          // Columns
-         oopsie_graphics_draw_string(POINT(2, 4), "TIME                     ACTION    PATH", DARKGRAY, BLACK);
+         char time_hdr[32] = "TIME";
+         char action_hdr[32] = "ACTION";
+         char path_hdr[32] = "PATH";
+         if (g_current_sort == SORT_TIME)
+            strcat(time_hdr, g_sort_descending ? " ↓" : " ↑");
+         if (g_current_sort == SORT_ACTION)
+            strcat(action_hdr, g_sort_descending ? " ↓" : " ↑");
+         if (g_current_sort == SORT_PATH)
+            strcat(path_hdr, g_sort_descending ? " ↓" : " ↑");
+         color_t time_clr = (g_current_sort == SORT_TIME) ? WHITE : DARKGRAY;
+         color_t action_clr = (g_current_sort == SORT_ACTION) ? WHITE : DARKGRAY;
+         color_t path_clr = (g_current_sort == SORT_PATH) ? WHITE : DARKGRAY;
+         oopsie_graphics_draw_string(POINT(2, 4), time_hdr, time_clr, BLACK);
+         oopsie_graphics_draw_string(POINT(27, 4), action_hdr, action_clr, BLACK);
+         oopsie_graphics_draw_string(POINT(37, 4), path_hdr, path_clr, BLACK);
          // Mock log entry
          for (size_t i = log_scrollbar.current_scroll; i < log_scrollbar.current_scroll + log_scrollbar.visible_items && i < fsize; i++) {
             const size_t offset = 6 + i - log_scrollbar.current_scroll;
@@ -425,8 +1132,14 @@ int main(int argc, char* argv[]) {
          oopsie_graphics_draw_string(POINT(sb_x + 6, 16), "Up", WHITE, BgColor);
          oopsie_graphics_draw_string(POINT(sb_x + 2, 17), "J:", WHITE, BgColor);
          oopsie_graphics_draw_string(POINT(sb_x + 6, 17), "Down", WHITE, BgColor);
-         oopsie_graphics_draw_string(POINT(sb_x + 2, 18), "Q:", WHITE, BgColor);
-         oopsie_graphics_draw_string(POINT(sb_x + 6, 18), "Quit", WHITE, BgColor);
+         oopsie_graphics_draw_string(POINT(sb_x + 2, 18), "H:", WHITE, BgColor);
+         oopsie_graphics_draw_string(POINT(sb_x + 6, 18), "Left", WHITE, BgColor);
+         oopsie_graphics_draw_string(POINT(sb_x + 2, 19), "L:", WHITE, BgColor);
+         oopsie_graphics_draw_string(POINT(sb_x + 6, 19), "Right", WHITE, BgColor);
+         oopsie_graphics_draw_string(POINT(sb_x + 2, 20), "T:", WHITE, BgColor);
+         oopsie_graphics_draw_string(POINT(sb_x + 6, 20), "Toggle", WHITE, BgColor);
+         oopsie_graphics_draw_string(POINT(sb_x + 2, 21), "Q:", WHITE, BgColor);
+         oopsie_graphics_draw_string(POINT(sb_x + 6, 21), "Quit", WHITE, BgColor);
          // ----- LOGO PANEL -----
          rect_t lg_rect = RECT(sb_x, ScreenWH.y - 6, sb_width, 5);
          oopsie_graphics_draw_rect_lines(lg_rect, GRAY, LIGHT_POINTY);
