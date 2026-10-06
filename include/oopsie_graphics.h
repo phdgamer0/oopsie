@@ -100,7 +100,12 @@ bool oopsie_graphics_check_screen_resize(void);
 
 // MODES
 void oopsie_graphics_begin_drawing(void);
+int oopsie_graphics_event_type(void);
+int oopsie_graphics_event_x(void);
+int oopsie_graphics_event_y(void);
 void oopsie_graphics_end_drawing(void);
+void oopsie_graphics_end_frame(void);
+void oopsie_graphics_skip_frame(void);
 
 // BASIC DRAWS
 void oopsie_graphics_set_bg_color(const color_t clr);

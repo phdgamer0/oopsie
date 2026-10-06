@@ -81,6 +81,7 @@ target_link_libraries(oopsie_wal PUBLIC uring)
 
 add_library(oopsie_shim SHARED src/shim.c)
 target_link_libraries(oopsie_shim PRIVATE oopsie_wal uring ${CMAKE_DL_LIBS})
+target_compile_options(oopsie_shim PRIVATE -O2 -Wall -Wextra -std=c2x)
 
 # Shim Tests
 add_executable(test_shim_basic tests/test_shim_basic.c)
@@ -107,6 +108,31 @@ add_executable(test_shim_rename tests/test_shim_rename.c)
 target_link_libraries(test_shim_rename PRIVATE oopsie_wal)
 add_test(NAME test_shim_rename COMMAND test_shim_rename)
 set_tests_properties(test_shim_rename PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:oopsie_shim>")
+
+add_executable(test_shim_paths tests/test_shim_paths.c)
+target_link_libraries(test_shim_paths PRIVATE oopsie_wal)
+add_test(NAME test_shim_paths COMMAND test_shim_paths)
+set_tests_properties(test_shim_paths PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:oopsie_shim>")
+
+add_executable(test_shim_truncate tests/test_shim_truncate.c)
+target_link_libraries(test_shim_truncate PRIVATE oopsie_wal)
+add_test(NAME test_shim_truncate COMMAND test_shim_truncate)
+set_tests_properties(test_shim_truncate PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:oopsie_shim>")
+
+add_executable(test_shim_dedup tests/test_shim_dedup.c)
+target_link_libraries(test_shim_dedup PRIVATE oopsie_wal)
+add_test(NAME test_shim_dedup COMMAND test_shim_dedup)
+set_tests_properties(test_shim_dedup PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:oopsie_shim>")
+
+add_executable(test_shim_hooks tests/test_shim_hooks.c)
+target_link_libraries(test_shim_hooks PRIVATE oopsie_wal)
+add_test(NAME test_shim_hooks COMMAND test_shim_hooks)
+set_tests_properties(test_shim_hooks PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:oopsie_shim>")
+
+add_executable(test_shim_extra tests/test_shim_extra.c)
+target_link_libraries(test_shim_extra PRIVATE oopsie_wal)
+add_test(NAME test_shim_extra COMMAND test_shim_extra)
+set_tests_properties(test_shim_extra PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:oopsie_shim>")
 
 # New Parser Tests
 add_executable(test_parse_basic tests/test_parse_basic.c)

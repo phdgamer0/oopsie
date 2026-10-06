@@ -118,8 +118,7 @@ void oopsie_graphics_begin_drawing() {
    memset((void*)&ev, (int)0, (size_t)24);
 }
 
-void oopsie_graphics_end_drawing(void) {
-   tb_present();
+void oopsie_graphics_end_frame(void) {
    timespec_get(&t, TIME_UTC);
    last_farme_time = ((uint64_t)t.tv_sec * 1000000000ULL) + t.tv_nsec - last_farme_time;
    if (wait_time > last_farme_time) {
@@ -136,6 +135,30 @@ void oopsie_graphics_end_drawing(void) {
          MousePos = POINT(ev.x, ev.y);
       }
    }
+}
+
+void oopsie_graphics_end_drawing(void) {
+   tb_present();
+   oopsie_graphics_end_frame();
+}
+
+void oopsie_graphics_skip_frame(void) {
+   timespec_get(&t, TIME_UTC);
+   last_farme_time = ((uint64_t)t.tv_sec * 1000000000ULL) + t.tv_nsec;
+   memset((void*)&ev, (int)0, (size_t)24);
+   oopsie_graphics_end_frame();
+}
+
+int oopsie_graphics_event_type(void) {
+   return (int)ev.type;
+}
+
+int oopsie_graphics_event_x(void) {
+   return (int)ev.x;
+}
+
+int oopsie_graphics_event_y(void) {
+   return (int)ev.y;
 }
 
 void oopsie_graphics_set_bg_color(const color_t clr) {

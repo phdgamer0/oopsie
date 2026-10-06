@@ -138,6 +138,33 @@ size_t WalFile_GetPrevious(const OopWalContext* WalFile, size_t current_offset, 
    return prev_off;
 }
 
+bool WalFile_HasPath(const OopWalContext* WalFile, const char* path, size_t pathlen) {
+   if (!WalFile->map || path == NULL || pathlen == (size_t)0) {
+      return false;
+   }
+   WalHeader* header = (WalHeader*)(WalFile->map);
+   uint64_t limit = __atomic_load_n(&header->current_offset, __ATOMIC_ACQUIRE);
+   uintptr_t offset = (uintptr_t)sizeof(WalHeader);
+   while (offset < (uintptr_t)limit) {
+      OopWalRecord* curr_rec = (OopWalRecord*)((uintptr_t)WalFile->map + offset);
+      if (curr_rec->magic == RECORD_MAGIC) {
+         if (curr_rec->pathlen == pathlen &&
+             memcmp((const char*)((uintptr_t)curr_rec + (uintptr_t)sizeof(*curr_rec)), path, pathlen) == 0) {
+            return true;
+         }
+      }
+      else if (curr_rec->magic != TOMBSTONE_MAGIC) {
+         break;
+      }
+      size_t rec_size = (sizeof(OopWalRecord) + curr_rec->pathlen + sizeof(uint32_t) + (size_t)7) & ~(size_t)7;
+      if (rec_size < sizeof(OopWalRecord)) {
+         break;
+      }
+      offset += rec_size;
+   }
+   return false;
+}
+
 size_t WalFile_Parse(const OopWalContext* WalFile, OopWalRecordView* views, size_t max_views) {
    if (!WalFile->map)
       return (size_t)0;
@@ -165,6 +192,48 @@ void WalFile_Purge(OopWalContext* WalFile, OopWalRecordView* view) {
       return;
    __atomic_store_n(&view->rec->magic, TOMBSTONE_MAGIC, __ATOMIC_SEQ_CST);
    __atomic_add_fetch(&((WalHeader*)WalFile->map)->toombstone, 1, __ATOMIC_SEQ_CST);
+}
+
+size_t compact_next_record(const OopWalContext* WalFile, size_t offset, size_t limit, OopWalRecord** out_rec, size_t* out_size) {
+   *out_rec = NULL;
+   *out_size = (size_t)0;
+   if (offset < sizeof(WalHeader) || offset >= limit) {
+      return (size_t)-1;
+   }
+   OopWalRecord* rec = (OopWalRecord*)((uintptr_t)WalFile->map + (uintptr_t)offset);
+   size_t rec_size = sizeof(OopWalRecord) + rec->pathlen + sizeof(uint32_t);
+   rec_size = (rec_size + 7) & ~(size_t)7;
+   if (offset + rec_size > limit) {
+      return (size_t)-1;
+   }
+   *out_rec = rec;
+   *out_size = rec_size;
+   return offset + rec_size;
+}
+
+static inline uint32_t compact_hash_path(const char* p, uint32_t len) {
+   uint32_t h = 2166136261u;
+   for (uint32_t i = 0; i < len; i++) {
+      h ^= (uint32_t)(unsigned char)p[i];
+      h *= 16777619u;
+   }
+   return h;
+}
+
+static int compact_find_slot(const uint64_t* path_flags, const char* path, uint32_t len) {
+   uint32_t key = compact_hash_path(path, len) | 1u;
+   uint32_t slot = key & (COMPACT_FLAG_SLOTS - 1);
+   for (uint32_t probe = 0; probe < COMPACT_FLAG_SLOTS; probe++) {
+      uint32_t idx = (slot + probe) & (COMPACT_FLAG_SLOTS - 1);
+      uint64_t entry = path_flags[idx];
+      if (entry == 0) {
+         return -1;
+      }
+      if ((uint32_t)(entry >> 32) == key) {
+         return (int)idx;
+      }
+   }
+   return -1;
 }
 
 bool WalFile_Compact(OopWalContext* WalFile) {
@@ -197,19 +266,90 @@ bool WalFile_Compact(OopWalContext* WalFile) {
    uintptr_t _old_offset = sizeof(WalHeader);
    const uintptr_t _max_offset = (uintptr_t)oldheader->current_offset;
    
+   uint64_t* path_flags = (uint64_t*)calloc(COMPACT_FLAG_SLOTS, sizeof(uint64_t));
+   uint8_t* emitted = (uint8_t*)calloc(COMPACT_FLAG_SLOTS, sizeof(uint8_t));
+   bool flags_ok = (path_flags != NULL && emitted != NULL);
+   if (flags_ok) {
+      uintptr_t scan = sizeof(WalHeader);
+      while (scan < _max_offset) {
+         OopWalRecord* rec = NULL;
+         size_t scan_size = (size_t)0;
+         uintptr_t scan_next = compact_next_record(WalFile, scan, _max_offset, &rec, &scan_size);
+         if (scan_next == (uintptr_t)-1) {
+            break;
+         }
+         if (rec->magic == RECORD_MAGIC && rec->pathlen > 0) {
+            const char* rec_path = (const char*)((uintptr_t)rec + (uintptr_t)sizeof(*rec));
+            size_t hash_len = rec->pathlen;
+            if (rec->action == OopAction_RENAME) {
+               size_t first_len = strlen(rec_path);
+               hash_len = (first_len < rec->pathlen) ? first_len : rec->pathlen;
+            }
+            uint32_t key = compact_hash_path(rec_path, (uint32_t)hash_len) | 1u;
+            uint32_t bit = (rec->action == OopAction_CREATE) ? COMPACT_FLAG_CREATE : ((rec->action == OopAction_DELETE) ? COMPACT_FLAG_DELETE : COMPACT_FLAG_OTHER);
+            uint32_t slot = key & (COMPACT_FLAG_SLOTS - 1);
+            for (uint32_t probe = 0; probe < COMPACT_FLAG_SLOTS; probe++) {
+               uint32_t idx = (slot + probe) & (COMPACT_FLAG_SLOTS - 1);
+               uint64_t entry = path_flags[idx];
+               if (entry == 0) {
+                  path_flags[idx] = ((uint64_t)key << 32) | (uint64_t)bit;
+                  break;
+               }
+               if ((uint32_t)(entry >> 32) == key) {
+                  path_flags[idx] = entry | (uint64_t)bit;
+                  break;
+               }
+            }
+         }
+         scan = scan_next;
+      }
+   }
+
    struct io_uring ring;
    bool ring_ok = (io_uring_queue_init(TOMBSTONE_LIMIT, &ring, 0) == 0);
    char vault_paths[TOMBSTONE_LIMIT][BUFFER_SZ];
    uint32_t chunk_count = 0;
 
    while (_old_offset < _max_offset) {
-      const OopWalRecord* rec = (const OopWalRecord*)((uintptr_t)WalFile->map + _old_offset);
-      size_t rec_size = sizeof(OopWalRecord) + rec->pathlen + sizeof(uint32_t);
-      rec_size = (rec_size + 7) & ~(size_t)7;
+      OopWalRecord* rec = NULL;
+      size_t rec_size = (size_t)0;
+      uintptr_t next_offset = compact_next_record(WalFile, _old_offset, _max_offset, &rec, &rec_size);
+      if (next_offset == (uintptr_t)-1) {
+         break;
+      }
       if (rec->magic == RECORD_MAGIC) {
-         memcpy((void*)((uintptr_t)file + _new_offset), rec, rec_size);
-         _new_offset += rec_size;
-      } else if (rec->magic == TOMBSTONE_MAGIC && ring_ok) {
+         bool drop = false;
+         if (flags_ok && rec->pathlen > 0) {
+            const char* rec_path = (const char*)((uintptr_t)rec + (uintptr_t)sizeof(*rec));
+            uint32_t scan_len = rec->pathlen;
+            if (rec->action == OopAction_RENAME) {
+               size_t first_len = strlen(rec_path);
+               scan_len = (first_len < rec->pathlen) ? (uint32_t)first_len : rec->pathlen;
+            }
+            int idx = compact_find_slot(path_flags, rec_path, scan_len);
+            if (idx >= 0) {
+               uint32_t bits = (uint32_t)(path_flags[idx] & (uint64_t)0xFFFFFFFFu);
+               if (rec->action == OopAction_CREATE) {
+                  if ((bits & COMPACT_FLAG_DELETE) != 0 && (bits & COMPACT_FLAG_OTHER) == 0) {
+                     drop = true;
+                  }
+               }
+               if (!drop && rec->action != OopAction_RENAME) {
+                  uint32_t seen_bit = (rec->action == OopAction_CREATE) ? 1u : ((rec->action == OopAction_DELETE) ? 2u : 4u);
+                  if ((emitted[idx] & seen_bit) != 0) {
+                     drop = true;
+                  }
+                  else {
+                     emitted[idx] = (uint8_t)(emitted[idx] | seen_bit);
+                  }
+               }
+            }
+         }
+         if (!drop) {
+            memcpy((void*)((uintptr_t)file + _new_offset), rec, rec_size);
+            _new_offset += rec_size;
+         }
+      } else if (rec->magic == TOMBSTONE_MAGIC && ring_ok && rec->inode != 0) {
          make_vault_path(vault_paths[chunk_count], rec->inode);
          struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
          if (sqe) {
@@ -225,8 +365,10 @@ bool WalFile_Compact(OopWalContext* WalFile) {
             chunk_count = 0;
          }
       }
-      _old_offset += rec_size;
+      _old_offset = next_offset;
    }
+   free(path_flags);
+   free(emitted);
 
    if (ring_ok) {
       if (chunk_count > 0) {
@@ -299,4 +441,12 @@ void make_vault_path(char* buffer, unsigned long ino) {
    } while (ino > 0);
    size_t len = (temp + 47) - p + 1;
    memcpy(buffer + 22, p, len);
+}
+
+void make_vault_meta_path(char* buffer, unsigned long ino) {
+   make_vault_path(buffer, ino);
+   size_t len = strlen(buffer);
+   if (len + sizeof(".meta") <= BUFFER_SZ) {
+      memcpy(buffer + len, ".meta", sizeof(".meta"));
+   }
 }

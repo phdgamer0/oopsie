@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/xattr.h>
 #include <termbox2.h>
 #include <time.h>
 #include <unistd.h>
@@ -79,6 +81,106 @@ int compare_ls_views(const void* a, const void* b) {
    return compare_views(&la->v, &lb->v);
 }
 
+static bool blob_has_xattr(const char* blob, size_t blob_len, const char* name) {
+   size_t name_len = strlen(name);
+   size_t off = 0;
+   while (off + 6 <= blob_len) {
+      uint16_t rec_name_len = 0;
+      uint32_t value_len = 0;
+      memcpy(&rec_name_len, blob + off, sizeof(rec_name_len));
+      off += sizeof(rec_name_len);
+      memcpy(&value_len, blob + off, sizeof(value_len));
+      off += sizeof(value_len);
+      if (rec_name_len == 0 || off + (size_t)rec_name_len + (size_t)value_len > blob_len) {
+         break;
+      }
+      if (rec_name_len == name_len && memcmp(blob + off, name, name_len) == 0) {
+         return true;
+      }
+      off += (size_t)rec_name_len + (size_t)value_len;
+   }
+   return false;
+}
+
+static void prune_extra_xattrs(const char* target_path, const char* blob, size_t blob_len) {
+   ssize_t need = llistxattr(target_path, NULL, 0);
+   if (need <= 0) {
+      return;
+   }
+   char* names = (char*)malloc((size_t)need);
+   if (names == NULL) {
+      return;
+   }
+   ssize_t got = llistxattr(target_path, names, (size_t)need);
+   size_t offset = 0;
+   while (got > 0 && offset < (size_t)got) {
+      const char* name = names + offset;
+      size_t name_len = strlen(name);
+      offset += name_len + 1;
+      if (!blob_has_xattr(blob, blob_len, name)) {
+         (void)lremovexattr(target_path, name);
+      }
+   }
+   free(names);
+}
+
+static bool apply_meta_blob(const char* target_path, unsigned long ino) {
+   char meta_path[256];
+   make_vault_meta_path(meta_path, ino);
+   int fd = open(meta_path, O_RDONLY);
+   if (fd < 0) {
+      return false;
+   }
+   OopMetaBlob meta;
+   bool applied = false;
+   if (read(fd, &meta, sizeof(meta)) == (ssize_t)sizeof(meta) && meta.magic == METABLOB_MAGIC) {
+      char* blob = NULL;
+      if (meta.xattr_len > 0) {
+         blob = (char*)malloc(meta.xattr_len);
+         if (blob != NULL && read(fd, blob, meta.xattr_len) != (ssize_t)meta.xattr_len) {
+            free(blob);
+            blob = NULL;
+         }
+      }
+      else {
+         blob = (char*)malloc(1);
+      }
+      if (blob != NULL) {
+         size_t off = 0;
+         while (off + 6 <= meta.xattr_len) {
+            uint16_t name_len = 0;
+            uint32_t value_len = 0;
+            memcpy(&name_len, blob + off, sizeof(name_len));
+            off += sizeof(name_len);
+            memcpy(&value_len, blob + off, sizeof(value_len));
+            off += sizeof(value_len);
+            if (name_len == 0 || name_len >= 256 || off + (size_t)name_len + (size_t)value_len > meta.xattr_len) {
+               break;
+            }
+            char name[256];
+            memcpy(name, blob + off, name_len);
+            name[name_len] = '\0';
+            off += name_len;
+            (void)lsetxattr(target_path, name, blob + off, value_len, 0);
+            off += value_len;
+         }
+         prune_extra_xattrs(target_path, blob, meta.xattr_len);
+         free(blob);
+      }
+      (void)chmod(target_path, (mode_t)(meta.mode & 07777));
+      (void)chown(target_path, (uid_t)meta.uid, (gid_t)meta.gid);
+      struct timeval times[2];
+      times[0].tv_sec = (time_t)meta.atime_sec;
+      times[0].tv_usec = (suseconds_t)(meta.atime_nsec / 1000);
+      times[1].tv_sec = (time_t)meta.mtime_sec;
+      times[1].tv_usec = (suseconds_t)(meta.mtime_nsec / 1000);
+      (void)utimes(target_path, times);
+      applied = true;
+   }
+   close(fd);
+   return applied;
+}
+
 bool do_restore(OopWalRecordView* view) {
    bool success = false;
    if (view->rec->action == OopAction_DELETE || view->rec->action == OopAction_MODIFY) {
@@ -103,6 +205,9 @@ bool do_restore(OopWalRecordView* view) {
             success = true;
          }
          close(srcFd);
+      }
+      if (view->rec->inode != 0 && apply_meta_blob(target_path, (unsigned long)view->rec->inode)) {
+         success = true;
       }
    }
    else if (view->rec->action == OopAction_RENAME) {
@@ -130,9 +235,16 @@ bool do_restore(OopWalRecordView* view) {
          success = true;
       }
       else {
-         // If it's already deleted, consider it successfully undone
          if (errno == ENOENT) {
             success = true;
+         }
+         else if (errno == EISDIR || errno == EPERM) {
+            struct stat dir_st;
+            if (lstat(target_path, &dir_st) == 0 && S_ISDIR(dir_st.st_mode)) {
+               if (rmdir(target_path) == 0 || errno == ENOENT) {
+                  success = true;
+               }
+            }
          }
       }
    }
@@ -775,6 +887,36 @@ void handle_args(int argc, char* argv[]) {
    }
 }
 
+typedef struct {
+   int32_t sw;
+   int32_t sh;
+   int32_t fsize;
+   int32_t views_changed;
+   int32_t sel;
+   int32_t scroll;
+   int32_t vis;
+   int32_t sort_mode;
+   int32_t desc;
+   int32_t is_mon;
+   int32_t focused;
+   int32_t cur_pos;
+   int32_t scroll_off;
+   int32_t ev_type;
+   int32_t ev_x;
+   int32_t ev_y;
+   uint64_t start_time;
+   uint64_t clock_sec;
+   uint64_t search_hash;
+} draw_sig_t;
+
+static uint64_t hash_search(const char* str) {
+   uint64_t h = 1469598103934665603ULL;
+   while (str && *str) {
+      h = (h ^ (uint64_t)(unsigned char)*str++) * 1099511628211ULL;
+   }
+   return h;
+}
+
 // Dummy toggle logic for TUI
 void my_toggle_cb(void) {
    OopWalContext wal;
@@ -789,6 +931,15 @@ void my_toggle_cb(void) {
 
 int main(int argc, char* argv[]) {
    OopWalRecordView views[VIEW_SZ] = {0};
+   draw_sig_t last_sig;
+   memset(&last_sig, 0, sizeof(last_sig));
+   last_sig.clock_sec = (uint64_t)-1;
+   OopWalRecordView raw_views[VIEW_SZ];
+   OopWalRecordView sorted_views[VIEW_SZ];
+   size_t sorted_n = 0;
+   sort_mode_t sorted_mode = SORT_TIME;
+   bool sorted_desc = true;
+   bool sorted_valid = false;
    handle_args(argc, argv);
    oopsie_graphics_init();
    oopsie_graphics_set_target_fps(60);
@@ -797,10 +948,10 @@ int main(int argc, char* argv[]) {
    // Check initial state for toggle
    bool is_mon = true;
    OopWalContext wal;
-   if (WalFile_Open(&wal, WAL_PATH)) {
+   bool wal_is_open = WalFile_Open(&wal, WAL_PATH);
+   if (wal_is_open) {
       WalHeader* header = (WalHeader*)wal.map;
       is_mon = __atomic_load_n(&header->is_monitoring, __ATOMIC_RELAXED) == 1;
-      WalFile_Close(&wal);
    }
 
    char search_buf[256] = {0};
@@ -823,13 +974,16 @@ int main(int argc, char* argv[]) {
    while (keep_running) {
       oopsie_graphics_check_screen_resize();
       size_t fsize = 0;
+      bool views_changed = true;
       uint64_t start_time = 0;
-      bool wal_is_open = WalFile_Open(&wal, WAL_PATH);
+      if (!wal_is_open) {
+         wal_is_open = WalFile_Open(&wal, WAL_PATH);
+      }
       if (wal_is_open) {
          WalHeader* header = (WalHeader*)wal.map;
          is_mon = __atomic_load_n(&header->is_monitoring, __ATOMIC_RELAXED) == 1;
          start_time = __atomic_load_n(&header->start_time, __ATOMIC_RELAXED);
-         fsize = WalFile_Parse(&wal, views, VIEW_SZ);
+         fsize = WalFile_Parse(&wal, raw_views, VIEW_SZ);
          if (search_box.buffer && search_box.buffer[0] != '\0') {
             size_t filtered_count = 0;
             for (size_t i = 0; i < fsize; i++) {
@@ -840,16 +994,30 @@ int main(int argc, char* argv[]) {
                memcpy(temp_path, views[i].path, len);
                temp_path[len] = '\0';
                if (strstr(temp_path, search_box.buffer)) {
-                  views[filtered_count++] = views[i];
+                  raw_views[filtered_count++] = raw_views[i];
                }
             }
             fsize = filtered_count;
          }
          if (selected_index >= fsize)
             selected_index = (size_t)-1;
-         if (fsize > 0) {
-            qsort(views, fsize, sizeof(OopWalRecordView), compare_views);
+         if (!sorted_valid || fsize != sorted_n || g_current_sort != sorted_mode ||
+             g_sort_descending != sorted_desc ||
+             memcmp(raw_views, sorted_views, fsize * sizeof(OopWalRecordView)) != 0) {
+            if (fsize > 0) {
+               qsort(raw_views, fsize, sizeof(OopWalRecordView), compare_views);
+            }
+            memcpy(sorted_views, raw_views, fsize * sizeof(OopWalRecordView));
+            sorted_n = fsize;
+            sorted_mode = g_current_sort;
+            sorted_desc = g_sort_descending;
+            sorted_valid = true;
+            views_changed = true;
          }
+         else {
+            views_changed = false;
+         }
+         memcpy(views, sorted_views, fsize * sizeof(OopWalRecordView));
       }
       size_t old_fsize = log_scrollbar.total_items;
       log_scrollbar.total_items = fsize;
@@ -987,9 +1155,35 @@ int main(int argc, char* argv[]) {
       }
 
       // 2. DRAW
+      draw_sig_t sig;
+      memset(&sig, 0, sizeof(sig));
+      sig.sw = (int32_t)ScreenWH.x;
+      sig.sh = (int32_t)ScreenWH.y;
+      sig.fsize = (int32_t)fsize;
+      sig.views_changed = views_changed ? 1 : 0;
+      sig.sel = (int32_t)selected_index;
+      sig.scroll = (int32_t)log_scrollbar.current_scroll;
+      sig.vis = (int32_t)log_scrollbar.visible_items;
+      sig.sort_mode = (int32_t)g_current_sort;
+      sig.desc = g_sort_descending ? 1 : 0;
+      sig.is_mon = is_mon ? 1 : 0;
+      sig.focused = search_box.is_focused ? 1 : 0;
+      sig.cur_pos = (int32_t)search_box.cursor_pos;
+      sig.scroll_off = (int32_t)search_box.scroll_offset;
+      sig.ev_type = (int32_t)oopsie_graphics_event_type();
+      sig.ev_x = (int32_t)oopsie_graphics_event_x();
+      sig.ev_y = (int32_t)oopsie_graphics_event_y();
+      sig.start_time = start_time;
+      sig.clock_sec = (uint64_t)time(NULL);
+      sig.search_hash = hash_search(search_box.buffer);
+      if (memcmp(&sig, &last_sig, sizeof(sig)) == 0) {
+         oopsie_graphics_skip_frame();
+         continue;
+      }
+      last_sig = sig;
       oopsie_graphics_begin_drawing();
       oopsie_graphics_set_bg_color(BLACK);
-      time_t now = time(NULL);
+      time_t now = (time_t)sig.clock_sec;
       struct tm* t = localtime(&now);
       char time_str[64];
       strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", t);
@@ -1096,7 +1290,7 @@ int main(int argc, char* argv[]) {
          snprintf(s, 16, "%lu+", fsize);
          oopsie_graphics_draw_string(POINT(sb_x + 18, 4), s, WHITE, BgColor);
          oopsie_graphics_draw_string(POINT(sb_x + 2, 5), "Tombstones:", WHITE, BgColor);
-         snprintf(s, 16, "%u", ((const WalHeader*)wal.map)->toombstone);
+         snprintf(s, 16, "%u", wal_is_open ? ((const WalHeader*)wal.map)->toombstone : 0);
          oopsie_graphics_draw_string(POINT(sb_x + 18, 5), s, WHITE, BgColor);
          oopsie_graphics_draw_string(POINT(sb_x + 2, 6), "Uptime:", WHITE, BgColor);
          char uptime_str[32] = "0s";
@@ -1148,9 +1342,9 @@ int main(int argc, char* argv[]) {
          oopsie_graphics_draw_string(POINT(sb_x + 2, ScreenWH.y - 3), row3, PINK, BgColor);
       }
       oopsie_graphics_end_drawing();
-      if (wal_is_open) {
-         WalFile_Close(&wal);
-      }
+   }
+   if (wal_is_open) {
+      WalFile_Close(&wal);
    }
    oopsie_graphics_end();
    return 0;

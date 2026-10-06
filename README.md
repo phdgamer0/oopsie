@@ -2,6 +2,10 @@
 
 This branch contains the Ring-3 (User Space) implementation of the `oopsie` undo utility.
 
+> IMPORTANT!
+>
+> This tool is still under development and may not be stable
+
 ## Architecture
 
 This approach is highly deployable (requires no root access) and relies on `LD_PRELOAD` to intercept libc calls before they hit the kernel. It uses `ioctl(FICLONE)` for zero-byte zero-copy metadata cloning and a memory-mapped binary Write-Ahead Log (WAL) to completely avoid standard file parsing bloat.
@@ -24,6 +28,12 @@ oopsie/
 ```
 
 ## Setup & Deployment
-(To be implemented)
+
+Clone and Build:
+
+```bash
+git clone https://github.com/phdgamer0/oopsie.git
+cd oopsie && make
+```
 
 *Note: This branch runs entirely in user-space.*
