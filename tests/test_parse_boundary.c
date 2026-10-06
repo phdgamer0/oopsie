@@ -21,12 +21,11 @@ int main(void) {
    
    
    
-   int fd1 = open("/tmp/parse_bound.txt", O_CREAT | O_WRONLY, 0644);
-   if (fd1 >= 0) close(fd1);
-   
-   for (int i=0; i<9; i++) {
-       int fd = open("/tmp/parse_bound.txt", O_WRONLY);
-       if (fd >= 0) close(fd);
+   for (int i = 0; i < 5; i++) {
+      char pbuf[128];
+      sprintf(pbuf, "/tmp/parse_bound_%d.txt", i);
+      int fd = open(pbuf, O_CREAT | O_WRONLY, 0644);
+      if (fd >= 0) close(fd);
    }
    
    OopWalContext wal;

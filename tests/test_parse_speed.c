@@ -29,7 +29,9 @@ int main(void) {
    
    
    for (int i=0; i<NUM_RECORDS; i++) {
-       int fd = open("/tmp/parse_speed.txt", O_CREAT | O_WRONLY, 0644);
+       char pbuf[128];
+      sprintf(pbuf, "/tmp/parse_speed_%d.txt", i);
+      int fd = open(pbuf, O_CREAT | O_WRONLY, 0644);
        if (fd >= 0) close(fd);
    }
    

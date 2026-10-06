@@ -20,7 +20,9 @@ int main(void) {
    
    
    for(int i=0; i<5; i++) {
-       int fd = open("/tmp/purge_bound.txt", O_CREAT | O_WRONLY, 0644);
+       char pbuf[128];
+      sprintf(pbuf, "/tmp/purge_bound_%d.txt", i);
+      int fd = open(pbuf, O_CREAT | O_WRONLY, 0644);
        if (fd >= 0) close(fd);
    }
    
