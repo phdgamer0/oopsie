@@ -988,10 +988,10 @@ int main(int argc, char* argv[]) {
             size_t filtered_count = 0;
             for (size_t i = 0; i < fsize; i++) {
                char temp_path[512];
-               size_t len = views[i].rec->pathlen;
+               size_t len = raw_views[i].rec->pathlen;
                if (len >= sizeof(temp_path))
                   len = sizeof(temp_path) - 1;
-               memcpy(temp_path, views[i].path, len);
+               memcpy(temp_path, raw_views[i].path, len);
                temp_path[len] = '\0';
                if (strstr(temp_path, search_box.buffer)) {
                   raw_views[filtered_count++] = raw_views[i];

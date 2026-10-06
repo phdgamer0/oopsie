@@ -15,6 +15,14 @@ void true_unlink(const char* path) {
 #endif
 }
 
+int true_open(const char* path, int flags, mode_t mode) {
+#ifdef SYS_open
+   return (int)syscall(SYS_open, path, flags, mode);
+#else
+   return (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
+#endif
+}
+
 int path_matches(const char* path_ptr, uint32_t pathlen, const char* path) {
    size_t want = strlen(path);
    if ((size_t)pathlen != want)
@@ -43,7 +51,7 @@ int find_record(OopWalContext* wal, const char* path, uint8_t action, OopWalReco
 int vault_matches(const OopWalRecord* rec, const char* expected, size_t expected_len) {
    char vault_path[BUFFER_SZ];
    make_vault_path(vault_path, (unsigned long)rec->inode);
-   int fd = syscall(SYS_open, vault_path, O_RDONLY);
+   int fd = true_open(vault_path, O_RDONLY, 0);
    if (fd < 0)
       return 0;
    char buff[256];

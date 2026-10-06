@@ -15,6 +15,14 @@ void true_unlink(const char* path) {
 #endif
 }
 
+int true_open(const char* path, int flags, mode_t mode) {
+#ifdef SYS_open
+   return (int)syscall(SYS_open, path, flags, mode);
+#else
+   return (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
+#endif
+}
+
 void reset_wal(OopWalContext* wal) {
    WalFile_Close(wal);
    mkdir("/tmp/oopsie", 0700);
@@ -67,7 +75,7 @@ int vault_content(OopWalContext* wal, const char* path, char* out, size_t max) {
       return -1;
    char vault_path[BUFFER_SZ];
    make_vault_path(vault_path, (unsigned long)ino);
-   int fd = syscall(SYS_open, vault_path, O_RDONLY);
+   int fd = true_open(vault_path, O_RDONLY, 0);
    if (fd < 0)
       return -1;
    ssize_t got = read(fd, out, max - 1);
@@ -102,7 +110,7 @@ int main() {
 
    const char* reopen_path = "/tmp/test_shim_dedup_reopen.txt";
    true_unlink(reopen_path);
-   int fd = syscall(SYS_open, reopen_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+   int fd = true_open(reopen_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
    if (fd < 0) {
       printf("[TEST] FAILED: cannot seed reopen file\n");
       return 1;
@@ -136,7 +144,7 @@ int main() {
 
    const char* trunc_path = "/tmp/test_shim_dedup_trunc.txt";
    true_unlink(trunc_path);
-   fd = syscall(SYS_open, trunc_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+   fd = true_open(trunc_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
    if (fd < 0) {
       printf("[TEST] FAILED: cannot seed trunc file\n");
       return 1;

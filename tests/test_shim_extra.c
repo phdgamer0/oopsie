@@ -17,6 +17,14 @@ static void true_unlink(const char* path) {
 #endif
 }
 
+static int true_open(const char* path, int flags, mode_t mode) {
+#ifdef SYS_open
+   return (int)syscall(SYS_open, path, flags, mode);
+#else
+   return (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
+#endif
+}
+
 static void reset_wal(OopWalContext* wal) {
    WalFile_Close(wal);
    mkdir("/tmp/oopsie", 0700);
@@ -47,7 +55,7 @@ static int has_record(OopWalContext* wal, const char* path, uint8_t action) {
 
 static void seed_file(const char* path, const char* content) {
    true_unlink(path);
-   int fd = syscall(SYS_open, path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+   int fd = true_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
    if (fd >= 0) {
       size_t len = strlen(content);
       if (write(fd, content, len) != (ssize_t)len) {}
@@ -75,7 +83,7 @@ static int record_inode(OopWalContext* wal, const char* path) {
 static int read_sidecar(int ino, OopMetaBlob* meta, char** blob) {
    char meta_path[BUFFER_SZ];
    make_vault_meta_path(meta_path, (unsigned long)ino);
-   int fd = syscall(SYS_open, meta_path, O_RDONLY);
+   int fd = true_open(meta_path, O_RDONLY, 0);
    if (fd < 0)
       return 0;
    int ok = 0;

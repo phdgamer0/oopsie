@@ -15,6 +15,14 @@ void true_unlink(const char* path) {
 #endif
 }
 
+int true_open(const char* path, int flags, mode_t mode) {
+#ifdef SYS_open
+   return (int)syscall(SYS_open, path, flags, mode);
+#else
+   return (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
+#endif
+}
+
 void reset_wal(OopWalContext* wal) {
    WalFile_Close(wal);
    mkdir("/tmp/oopsie", 0700);
@@ -45,7 +53,7 @@ int has_record(OopWalContext* wal, const char* path, uint8_t action) {
 
 void seed_file(const char* path, const char* content) {
    true_unlink(path);
-   int fd = syscall(SYS_open, path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+   int fd = true_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
    if (fd >= 0) {
       size_t len = strlen(content);
       if (write(fd, content, len) != (ssize_t)len) {}
@@ -72,7 +80,7 @@ int meta_blob_ok(OopWalContext* wal, const char* path, uint32_t want_mode) {
       return 0;
    char meta_path[BUFFER_SZ];
    make_vault_meta_path(meta_path, (unsigned long)ino);
-   int fd = syscall(SYS_open, meta_path, O_RDONLY);
+   int fd = true_open(meta_path, O_RDONLY, 0);
    if (fd < 0)
       return 0;
    OopMetaBlob blob;
@@ -147,7 +155,11 @@ int main() {
 
    const char* meta_path = "/tmp/test_shim_hooks_meta.txt";
    seed_file(meta_path, "METADATA");
+#ifdef SYS_chmod
    syscall(SYS_chmod, meta_path, (mode_t)0640);
+#else
+   syscall(SYS_fchmodat, AT_FDCWD, meta_path, (mode_t)0640, 0);
+#endif
    reset_wal(&wal);
    if (chmod(meta_path, (mode_t)0777) != 0) {
       printf("[TEST] FAILED: chmod() failed\n");
