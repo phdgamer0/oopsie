@@ -32,8 +32,7 @@ oopsie/
 Clone and Build:
 
 ```bash
-git clone https://github.com/phdgamer0/oopsie.git
-cd oopsie && make
+curl -fsSL https://raw.githubusercontent.com/phdgamer0/oopsie/linux_user/install.sh | sh
 ```
 
 *Note: This branch runs entirely in user-space.*
