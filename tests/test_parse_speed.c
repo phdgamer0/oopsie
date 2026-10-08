@@ -8,6 +8,7 @@
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
+#include "vault_purge.h"
 
 #define NUM_RECORDS 10000
 
@@ -17,6 +18,7 @@ static double get_time_ms(struct timespec start, struct timespec end) {
 
 int main(void) {
    mkdir("/tmp/oopsie", 0700);
+   vault_purge();
    OopWalContext reset_wal;
    if (WalFile_Open(&reset_wal, "/tmp/oopsie/vault.wal")) {
        WalHeader* hdr = (WalHeader*)reset_wal.map;
@@ -62,5 +64,6 @@ int main(void) {
    WalFile_Close(&wal);
    free(views);
    printf("[TEST] PASSED!\n");
+   vault_purge();
    return 0;
 }

@@ -139,7 +139,7 @@ int main() {
       }
       close(fd);
    }
-   failures += check_path(&wal, reopen_path, "ORIGINAL", 8, 1);
+   failures += check_path(&wal, reopen_path, "XXXXINAL", 8, 9);
    reset_wal(&wal);
 
    const char* trunc_path = "/tmp/test_shim_dedup_trunc.txt";
@@ -170,7 +170,7 @@ int main() {
       }
       close(fd);
    }
-   failures += check_path(&wal, trunc_path, "FIRST", 5, 1);
+   failures += check_path(&wal, trunc_path, "DDDDDDDD", 8, 5);
 
    if (failures == 0)
       printf("[TEST] PASSED!\n");

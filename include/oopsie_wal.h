@@ -76,6 +76,7 @@ typedef struct {
 } OopWalRecordView;
 
 bool WalFile_IsOpen(const OopWalContext* WalFile);
+bool WalFile_IsCurrent(const OopWalContext* WalFile);
 bool WalFile_Open(OopWalContext* WalFile, const char* Path);
 size_t WalFile_Append(OopWalContext* WalFile, const char* Path, const OopWalRecord* RecP);
 bool WalFile_Close(OopWalContext* WalFile);

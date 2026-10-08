@@ -16,7 +16,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SHIM_SHOULD_MONITOR() (WalFile_IsOpen(&GlobalWal) && __atomic_load_n(&((WalHeader*)GlobalWal.map)->is_monitoring, __ATOMIC_RELAXED) == 1)
+#define SHIM_SHOULD_MONITOR() (oopsie_is_external() && oopsie_wal_sync() && __atomic_load_n(&((WalHeader*)GlobalWal.map)->is_monitoring, __ATOMIC_RELAXED) == 1)
 #define PATH_BUFF_SIZE (size_t)4096
 
 static inline bool is_ignored_path(const char* p) {
@@ -87,6 +87,48 @@ static bool resolve_fd_path(int fd, char* __restrict abs_path, size_t max_len) {
 }
 
 OopWalContext GlobalWal;
+
+static unsigned wal_reentry = 0;
+
+static void shim_log(const char* __restrict fmt, ...);
+
+static int Shim_Is_Oopsie = 0;
+
+static bool oopsie_is_external(void) {
+   if (__atomic_load_n(&Shim_Is_Oopsie, __ATOMIC_ACQUIRE) == 0) {
+      char exe_path[PATH_BUFF_SIZE];
+      ssize_t n = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+      if (n > 0) {
+         exe_path[n] = '\0';
+         const char* base = strrchr(exe_path, '/');
+         base = (base != NULL) ? base + 1 : exe_path;
+         if (strncmp(base, "Oopsie", 6) == 0 && base[6] == '\0') {
+            __atomic_store_n(&Shim_Is_Oopsie, 1, __ATOMIC_RELEASE);
+            return false;
+         }
+      }
+      __atomic_store_n(&Shim_Is_Oopsie, 2, __ATOMIC_RELEASE);
+   }
+   return __atomic_load_n(&Shim_Is_Oopsie, __ATOMIC_ACQUIRE) == 2;
+}
+
+static bool oopsie_wal_sync(void) {
+   if (__atomic_load_n(&wal_reentry, __ATOMIC_RELAXED) != 0) {
+      return false;
+   }
+   if (!WalFile_IsOpen(&GlobalWal)) {
+      return false;
+   }
+   if (WalFile_IsCurrent(&GlobalWal)) {
+      return true;
+   }
+   __atomic_store_n(&wal_reentry, 1, __ATOMIC_RELAXED);
+   WalFile_Close(&GlobalWal);
+   shim_log("wal stale, reopening");
+   bool ok = WalFile_Open(&GlobalWal, WAL_PATH);
+   __atomic_store_n(&wal_reentry, 0, __ATOMIC_RELAXED);
+   return ok;
+}
 
 __attribute__((constructor)) void oopsie_init() {
    mkdir("/tmp/oopsie", 0700);
@@ -159,6 +201,30 @@ gnu_truncate_t* gnu_truncate = NULL;
 gnu_flistxattr_t* gnu_flistxattr = NULL;
 gnu_fgetxattr_t* gnu_fgetxattr = NULL;
 
+static void shim_log(const char* __restrict fmt, ...) {
+   if (gnu_open == NULL) {
+      return;
+   }
+   char line[1024];
+   int base = snprintf(line, sizeof(line), "%lu [%d] ", (unsigned long)time(NULL), (int)getpid());
+   if (base < 0) {
+      return;
+   }
+   va_list args;
+   va_start(args, fmt);
+   int n = vsnprintf(line + base, sizeof(line) - (size_t)base, fmt, args);
+   va_end(args);
+   if (n < 0) {
+      return;
+   }
+   int fd = gnu_open("/tmp/oopsie/shim.log", O_WRONLY | O_CREAT | O_APPEND, 0600);
+   if (fd < 0) {
+      return;
+   }
+   (void)write(fd, line, (size_t)(base + n));
+   close(fd);
+}
+
 static inline bool vault_copy(int dirfd, const char* __restrict rel_path, const struct stat* __restrict stat_buf) {
    char buffer[BUFFER_SZ];
    make_vault_path(buffer, (unsigned long)stat_buf->st_ino);
@@ -191,6 +257,19 @@ static inline void record_modify(const char* __restrict abs_path, const struct s
    rec.pathlen = (uint32_t)strlen(abs_path);
    rec.inode = (uint64_t)stat_buf->st_ino;
    WalFile_Append(&GlobalWal, abs_path, &rec);
+   shim_log("record MODIFY path=%s ino=%llu size=%lld", abs_path, (unsigned long long)stat_buf->st_ino, (long long)stat_buf->st_size);
+}
+
+static inline void record_meta(const char* __restrict abs_path, const struct stat* __restrict stat_buf) {
+   OopWalRecord rec;
+   rec.magic = RECORD_MAGIC;
+   rec.action = OopAction_MODIFY;
+   rec.filesize = (uint64_t)0;
+   rec.timestamp = (uint64_t)time(NULL);
+   rec.pathlen = (uint32_t)strlen(abs_path);
+   rec.inode = (uint64_t)stat_buf->st_ino;
+   WalFile_Append(&GlobalWal, abs_path, &rec);
+   shim_log("record META path=%s ino=%llu", abs_path, (unsigned long long)stat_buf->st_ino);
 }
 
 static inline void record_delete(const char* __restrict abs_path, const struct stat* __restrict stat_buf) {
@@ -202,6 +281,7 @@ static inline void record_delete(const char* __restrict abs_path, const struct s
    rec.pathlen = (uint32_t)strlen(abs_path);
    rec.inode = (uint64_t)stat_buf->st_ino;
    WalFile_Append(&GlobalWal, abs_path, &rec);
+   shim_log("record DELETE path=%s ino=%llu size=%lld", abs_path, (unsigned long long)stat_buf->st_ino, (long long)stat_buf->st_size);
 }
 
 static inline void record_create(const char* __restrict abs_path) {
@@ -213,6 +293,7 @@ static inline void record_create(const char* __restrict abs_path) {
    rec.pathlen = (uint32_t)strlen(abs_path);
    rec.inode = (uint64_t)0;
    WalFile_Append(&GlobalWal, abs_path, &rec);
+   shim_log("record CREATE path=%s", abs_path);
 }
 
 #define GUARD_SLOTS (size_t)65536
@@ -226,9 +307,10 @@ static unsigned long Guard_Inodes[GUARD_SLOTS];
 static unsigned char Guard_States[GUARD_SLOTS];
 
 typedef enum {
-   GUARD_CLAIMED,
-   GUARD_ALREADY,
-   GUARD_FAILED,
+   GUARD_CLAIMED = 0,
+   GUARD_ALREADY = 1,
+   GUARD_META = 3,
+   GUARD_FAILED = 4,
 } GuardResult_t;
 
 typedef enum {
@@ -276,7 +358,14 @@ static GuardResult_t guard_claim(const char* abs_path, unsigned long ino) {
       }
    }
    if (found != (size_t)-1) {
-      return (__atomic_load_n(&Guard_States[found], __ATOMIC_ACQUIRE) == GUARD_DONE) ? GUARD_ALREADY : GUARD_FAILED;
+      unsigned char st = __atomic_load_n(&Guard_States[found], __ATOMIC_ACQUIRE);
+      if (st == GUARD_DONE) {
+         return GUARD_ALREADY;
+      }
+      if (st == GUARD_META) {
+         return GUARD_META;
+      }
+      return GUARD_FAILED;
    }
    size_t base = guard_slot_of(key);
    for (size_t i = 0; i < GUARD_PROBES; i++) {
@@ -299,6 +388,22 @@ static void guard_finish(const char* abs_path, bool commit) {
       return;
    }
    __atomic_store_n(&Guard_States[s], (unsigned char)(commit ? GUARD_DONE : GUARD_EMPTY), __ATOMIC_RELEASE);
+}
+
+static void guard_finish_meta(const char* abs_path) {
+   size_t s = guard_lookup(guard_path_hash(abs_path));
+   if (s == (size_t)-1) {
+      return;
+   }
+   __atomic_store_n(&Guard_States[s], GUARD_META, __ATOMIC_RELEASE);
+}
+
+static void guard_release(const char* abs_path) {
+   size_t s = guard_lookup(guard_path_hash(abs_path));
+   if (s == (size_t)-1) {
+      return;
+   }
+   __atomic_store_n(&Guard_States[s], GUARD_EMPTY, __ATOMIC_RELEASE);
 }
 
 static bool collect_xattrs(int fd, char** out_buf, size_t* out_len) {
@@ -414,38 +519,47 @@ static bool write_meta_blob(int dirfd, const char* __restrict rel_path, const st
    return destFd >= 0;
 }
 
-static CaptureResult_t vault_ensure(int dirfd, const char* __restrict rel_path, const char* __restrict abs_path, const struct stat* __restrict stat_buf, bool trunc_move) {
+static CaptureResult_t vault_ensure(int dirfd, const char* __restrict rel_path, const char* __restrict abs_path, const struct stat* __restrict stat_buf, bool trunc_move, bool new_transaction) {
    GuardResult_t claim = guard_claim(abs_path, (unsigned long)stat_buf->st_ino);
-   if (claim == GUARD_ALREADY) {
+   if (claim == GUARD_ALREADY && !new_transaction) {
+      shim_log("skip capture path=%s ino=%llu (dup transaction)", abs_path, (unsigned long long)stat_buf->st_ino);
       return CAPTURE_SKIPPED;
    }
-   bool ok = write_meta_blob(dirfd, rel_path, stat_buf);
+   if (claim == GUARD_ALREADY && new_transaction) {
+      shim_log("recapture path=%s ino=%llu (new open)", abs_path, (unsigned long long)stat_buf->st_ino);
+      guard_release(abs_path);
+   }
+   (void)write_meta_blob(dirfd, rel_path, stat_buf);
    char buffer[BUFFER_SZ];
    make_vault_path(buffer, (unsigned long)stat_buf->st_ino);
    if (trunc_move) {
       if (dirfd == AT_FDCWD) {
          if (gnu_rename(rel_path, buffer) == 0) {
+            shim_log("capture moved path=%s ino=%llu", abs_path, (unsigned long long)stat_buf->st_ino);
             guard_finish(abs_path, true);
             return CAPTURE_MOVED;
          }
       }
       else {
          if (gnu_renameat(dirfd, rel_path, AT_FDCWD, buffer) == 0) {
+            shim_log("capture moved path=%s ino=%llu", abs_path, (unsigned long long)stat_buf->st_ino);
             guard_finish(abs_path, true);
             return CAPTURE_MOVED;
          }
       }
    }
    if (vault_copy(dirfd, rel_path, stat_buf)) {
+      shim_log("capture copied path=%s ino=%llu size=%lld", abs_path, (unsigned long long)stat_buf->st_ino, (long long)stat_buf->st_size);
       guard_finish(abs_path, true);
       return CAPTURE_COPIED;
    }
-   guard_finish(abs_path, ok);
+   shim_log("capture failed path=%s ino=%llu", abs_path, (unsigned long long)stat_buf->st_ino);
+   guard_finish(abs_path, false);
    return CAPTURE_FAILED;
 }
 
-static bool capture_modify_intent(int dirfd, const char* __restrict rel_path, const char* __restrict abs_path, const struct stat* __restrict stat_buf, bool trunc_move) {
-   CaptureResult_t cap = vault_ensure(dirfd, rel_path, abs_path, stat_buf, trunc_move);
+static bool capture_modify_intent(int dirfd, const char* __restrict rel_path, const char* __restrict abs_path, const struct stat* __restrict stat_buf, bool trunc_move, bool new_transaction) {
+   CaptureResult_t cap = vault_ensure(dirfd, rel_path, abs_path, stat_buf, trunc_move, new_transaction);
    if (cap == CAPTURE_MOVED || cap == CAPTURE_COPIED) {
       record_modify(abs_path, stat_buf);
       return true;
@@ -455,7 +569,7 @@ static bool capture_modify_intent(int dirfd, const char* __restrict rel_path, co
 
 static bool note_metadata(int dirfd, const char* __restrict rel_path, const char* __restrict abs_path, const struct stat* __restrict stat_buf) {
    GuardResult_t claim = guard_claim(abs_path, (unsigned long)stat_buf->st_ino);
-   if (claim == GUARD_ALREADY) {
+   if (claim == GUARD_ALREADY || claim == GUARD_META) {
       return false;
    }
    if (WalFile_HasPath(&GlobalWal, abs_path, strlen(abs_path))) {
@@ -466,8 +580,8 @@ static bool note_metadata(int dirfd, const char* __restrict rel_path, const char
       guard_finish(abs_path, false);
       return false;
    }
-   record_modify(abs_path, stat_buf);
-   guard_finish(abs_path, true);
+   record_meta(abs_path, stat_buf);
+   guard_finish_meta(abs_path);
    return true;
 }
 
@@ -491,7 +605,7 @@ static inline void record_intent_open(int dirfd, const char* __restrict rel_path
    struct stat stat_;
    bool exists = (dirfd == AT_FDCWD) ? (lstat(rel_path, &stat_) == 0 && S_ISREG(stat_.st_mode)) : (fstatat(dirfd, rel_path, &stat_, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(stat_.st_mode));
    if (exists && ((flags & O_WRONLY) || (flags & O_RDWR) || (flags & O_TRUNC))) {
-      CaptureResult_t cap = vault_ensure(dirfd, rel_path, abs_path, &stat_, (flags & O_TRUNC) != 0);
+      CaptureResult_t cap = vault_ensure(dirfd, rel_path, abs_path, &stat_, (flags & O_TRUNC) != 0, true);
       if (cap == CAPTURE_MOVED || cap == CAPTURE_COPIED) {
          record_modify(abs_path, &stat_);
       }
@@ -552,7 +666,7 @@ int unlink(const char* path) {
    struct stat stat_buf;
    if (lstat(path, &stat_buf) == 0 && S_ISREG(stat_buf.st_mode)) {
       ensure_std_resolved();
-      (void)vault_ensure(AT_FDCWD, path, abs_path, &stat_buf, false);
+      (void)vault_ensure(AT_FDCWD, path, abs_path, &stat_buf, false, true);
       record_delete(abs_path, &stat_buf);
    }
    return gnu_unlink(path);
@@ -579,7 +693,7 @@ int unlinkat(int dirfd, const char* path, int flags) {
    struct stat stat_buf;
    if (fstatat(dirfd, path, &stat_buf, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(stat_buf.st_mode)) {
       ensure_std_resolved();
-      (void)vault_ensure(dirfd, path, abs_path, &stat_buf, false);
+      (void)vault_ensure(dirfd, path, abs_path, &stat_buf, false, true);
       record_delete(abs_path, &stat_buf);
    }
    return gnu_unlinkat(dirfd, path, flags);
@@ -608,7 +722,7 @@ int open(const char* pathname, int flags, ...) {
    int exists = (lstat(pathname, &stat_) == 0 && S_ISREG(stat_.st_mode));
    if (exists && ((flags & O_WRONLY) || (flags & O_RDWR) || (flags & O_TRUNC))) {
       ensure_std_resolved();
-      CaptureResult_t cap = vault_ensure(AT_FDCWD, pathname, abs_path, &stat_, (flags & O_TRUNC) != 0);
+      CaptureResult_t cap = vault_ensure(AT_FDCWD, pathname, abs_path, &stat_, (flags & O_TRUNC) != 0, true);
       if (cap == CAPTURE_MOVED || cap == CAPTURE_COPIED) {
          record_modify(abs_path, &stat_);
       }
@@ -646,7 +760,7 @@ int openat(int dirfd, const char* pathname, int flags, ...) {
    int exists = (fstatat(dirfd, pathname, &stat_, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(stat_.st_mode));
    if (exists && ((flags & O_WRONLY) || (flags & O_RDWR) || (flags & O_TRUNC))) {
       ensure_std_resolved();
-      CaptureResult_t cap = vault_ensure(dirfd, pathname, abs_path, &stat_, (flags & O_TRUNC) != 0);
+      CaptureResult_t cap = vault_ensure(dirfd, pathname, abs_path, &stat_, (flags & O_TRUNC) != 0, true);
       if (cap == CAPTURE_MOVED || cap == CAPTURE_COPIED) {
          record_modify(abs_path, &stat_);
       }
@@ -711,7 +825,7 @@ int rename(const char* oldpath, const char* newpath) {
    bool new_exists = (lstat(newpath, &stat_buf) == 0 && S_ISREG(stat_buf.st_mode));
    if (new_exists) {
       ensure_std_resolved();
-      (void)vault_ensure(AT_FDCWD, newpath, abs_new, &stat_buf, false);
+      (void)vault_ensure(AT_FDCWD, newpath, abs_new, &stat_buf, false, true);
       record_delete(abs_new, &stat_buf);
    }
    OopWalRecord rec_rename;
@@ -756,7 +870,7 @@ int renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpat
    bool new_exists = (fstatat(newdirfd, newpath, &stat_buf, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(stat_buf.st_mode));
    if (new_exists) {
       ensure_std_resolved();
-      (void)vault_ensure(newdirfd, newpath, abs_new, &stat_buf, false);
+      (void)vault_ensure(newdirfd, newpath, abs_new, &stat_buf, false, true);
       record_delete(abs_new, &stat_buf);
    }
    OopWalRecord rec_rename;
@@ -801,7 +915,7 @@ int renameat2(int olddirfd, const char* oldpath, int newdirfd, const char* newpa
    bool new_exists = (fstatat(newdirfd, newpath, &stat_buf, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(stat_buf.st_mode));
    if (new_exists) {
       ensure_std_resolved();
-      (void)vault_ensure(newdirfd, newpath, abs_new, &stat_buf, false);
+      (void)vault_ensure(newdirfd, newpath, abs_new, &stat_buf, false, true);
       record_delete(abs_new, &stat_buf);
    }
    OopWalRecord rec_rename;
@@ -834,7 +948,7 @@ int ftruncate(int fd, off_t length) {
       char abs_path[PATH_BUFF_SIZE];
       if (resolve_fd_path(fd, abs_path, sizeof(abs_path)) && !is_ignored_path(abs_path)) {
          ensure_std_resolved();
-         (void)capture_modify_intent(AT_FDCWD, abs_path, abs_path, &stat_buf, false);
+         (void)capture_modify_intent(AT_FDCWD, abs_path, abs_path, &stat_buf, false, false);
       }
    }
    return gnu_ftruncate(fd, length);
@@ -859,7 +973,7 @@ int truncate(const char* path, off_t length) {
    struct stat stat_buf;
    if (lstat(path, &stat_buf) == 0 && S_ISREG(stat_buf.st_mode) && length < stat_buf.st_size) {
       ensure_std_resolved();
-      (void)capture_modify_intent(AT_FDCWD, path, abs_path, &stat_buf, false);
+      (void)capture_modify_intent(AT_FDCWD, path, abs_path, &stat_buf, false, false);
    }
    return gnu_truncate(path, length);
 }

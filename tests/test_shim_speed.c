@@ -4,6 +4,7 @@
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
+#include "vault_purge.h"
 
 #define NUM_FILES 100000
 
@@ -12,6 +13,7 @@ static double get_time_ms(struct timespec start, struct timespec end) {
 }
 
 int main(void) {
+   vault_purge();
    printf("[TEST] Starting Shim Speed Test (%d files)...\n", NUM_FILES);
 
    char (*names)[256] = malloc(NUM_FILES * 256);
@@ -81,5 +83,6 @@ int main(void) {
    printf("  -> Throughput: %.0f deletions/second\n", (NUM_FILES / elapsed) * 1000.0);
 
    printf("[TEST] PASSED!\n");
+   vault_purge();
    return 0;
 }

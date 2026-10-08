@@ -207,7 +207,9 @@ bool do_restore(OopWalRecordView* view) {
          close(srcFd);
       }
       if (view->rec->inode != 0 && apply_meta_blob(target_path, (unsigned long)view->rec->inode)) {
-         success = true;
+         if (view->rec->filesize == 0) {
+            success = true;
+         }
       }
    }
    else if (view->rec->action == OopAction_RENAME) {
@@ -293,6 +295,13 @@ bool parse_indices(const char* str, size_t* indices, size_t* num_indices) {
    }
    free(s);
    return true;
+}
+
+static void resume_monitoring(OopWalContext* __restrict wal, uint32_t was_monitoring) {
+   if (was_monitoring && WalFile_IsOpen(wal)) {
+      WalHeader* header = (WalHeader*)wal->map;
+      __atomic_store_n(&header->is_monitoring, 1, __ATOMIC_RELAXED);
+   }
 }
 
 bool prompt_and_restore(OopWalContext* wal, LsView* view, bool silent) {
@@ -775,6 +784,7 @@ void handle_args(int argc, char* argv[]) {
             }
             if (m_count == 0) {
                printf("No matches found for path %s\n", opt_path);
+               resume_monitoring(&wal, was_monitoring);
                WalFile_Close(&wal);
                exit(1);
             }
@@ -813,6 +823,7 @@ void handle_args(int argc, char* argv[]) {
                   size_t num_indices = 0;
                   if (!parse_indices(input_buf, indices, &num_indices)) {
                      printf("Invalid indices format\n");
+                     resume_monitoring(&wal, was_monitoring);
                      WalFile_Close(&wal);
                      exit(1);
                   }
@@ -820,6 +831,7 @@ void handle_args(int argc, char* argv[]) {
                      size_t idx = indices[i];
                      if (idx >= fsize) {
                         printf("Index %zu out of bounds\n", idx);
+                        resume_monitoring(&wal, was_monitoring);
                         WalFile_Close(&wal);
                         exit(1);
                      }
@@ -834,6 +846,7 @@ void handle_args(int argc, char* argv[]) {
             size_t num_indices = 0;
             if (!parse_indices(opt_number, indices, &num_indices)) {
                printf("Invalid flag or option\n");
+               resume_monitoring(&wal, was_monitoring);
                WalFile_Close(&wal);
                exit(1);
             }
@@ -841,6 +854,7 @@ void handle_args(int argc, char* argv[]) {
                size_t idx = indices[i];
                if (idx >= fsize) {
                   printf("Index %zu out of bounds\n", idx);
+                  resume_monitoring(&wal, was_monitoring);
                   WalFile_Close(&wal);
                   exit(1);
                }
@@ -854,6 +868,7 @@ void handle_args(int argc, char* argv[]) {
          else {
             if (fsize == 0) {
                printf("No events to restore.\n");
+               resume_monitoring(&wal, was_monitoring);
                WalFile_Close(&wal);
                exit(1);
             }
@@ -871,9 +886,7 @@ void handle_args(int argc, char* argv[]) {
          if (did_restore) {
             WalFile_Compact(&wal);
          }
-         if (was_monitoring) {
-            __atomic_store_n(&header->is_monitoring, 1, __ATOMIC_RELAXED);
-         }
+         resume_monitoring(&wal, was_monitoring);
          WalFile_Close(&wal);
          if (opt_silent && any_failed)
             exit(1);
@@ -949,6 +962,9 @@ int main(int argc, char* argv[]) {
    bool is_mon = true;
    OopWalContext wal;
    bool wal_is_open = WalFile_Open(&wal, WAL_PATH);
+   bool pending_compact = false;
+   char restore_msg[64] = "";
+   bool restore_msg_failed = false;
    if (wal_is_open) {
       WalHeader* header = (WalHeader*)wal.map;
       is_mon = __atomic_load_n(&header->is_monitoring, __ATOMIC_RELAXED) == 1;
@@ -976,6 +992,14 @@ int main(int argc, char* argv[]) {
       size_t fsize = 0;
       bool views_changed = true;
       uint64_t start_time = 0;
+      if (pending_compact) {
+         pending_compact = false;
+         sorted_valid = false;
+         if (wal_is_open) {
+            WalFile_Compact(&wal);
+            wal_is_open = WalFile_IsOpen(&wal);
+         }
+      }
       if (!wal_is_open) {
          wal_is_open = WalFile_Open(&wal, WAL_PATH);
       }
@@ -1041,17 +1065,22 @@ int main(int argc, char* argv[]) {
          if (wal_is_open && selected_index < fsize) {
             OopWalRecordView* view = &views[selected_index];
             if (do_restore(view)) {
-               // Success
+               snprintf(restore_msg, sizeof(restore_msg), "Restored");
+               restore_msg_failed = false;
+               WalFile_Purge(&wal, view);
+               pending_compact = true;
+               selected_index = (size_t)-1;
+               fsize--;
             }
-            WalFile_Purge(&wal, view);
-            WalFile_Compact(&wal);
-            selected_index = (size_t)-1;
-            fsize--;
+            else {
+               snprintf(restore_msg, sizeof(restore_msg), "Restore failed");
+               restore_msg_failed = true;
+            }
          }
       }
       if (!search_box.is_focused && (oopsie_graphics_is_key_pressed('c') || oopsie_graphics_is_key_pressed('C'))) {
          if (wal_is_open) {
-            WalFile_Compact(&wal);
+            pending_compact = true;
          }
       }
       if (!search_box.is_focused && fsize > 0 && (oopsie_graphics_is_key_pressed('k') || oopsie_graphics_is_key_pressed('K'))) {
@@ -1096,7 +1125,7 @@ int main(int argc, char* argv[]) {
             for (size_t i = 0; i < fsize; i++) {
                WalFile_Purge(&wal, &views[i]);
             }
-            WalFile_Compact(&wal);
+            pending_compact = true;
          }
       }
       if (oopsie_graphics_is_key_pressed(TB_KEY_ARROW_UP)) {
@@ -1334,6 +1363,9 @@ int main(int argc, char* argv[]) {
          oopsie_graphics_draw_string(POINT(sb_x + 6, 20), "Toggle", WHITE, BgColor);
          oopsie_graphics_draw_string(POINT(sb_x + 2, 21), "Q:", WHITE, BgColor);
          oopsie_graphics_draw_string(POINT(sb_x + 6, 21), "Quit", WHITE, BgColor);
+         if (panel_h > 26 && restore_msg[0] != '\0') {
+            oopsie_graphics_draw_string(POINT(sb_x + 2, 22), restore_msg, restore_msg_failed ? RED : GREEN, BgColor);
+         }
          // ----- LOGO PANEL -----
          rect_t lg_rect = RECT(sb_x, ScreenWH.y - 6, sb_width, 5);
          oopsie_graphics_draw_rect_lines(lg_rect, GRAY, LIGHT_POINTY);

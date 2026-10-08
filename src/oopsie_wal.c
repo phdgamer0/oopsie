@@ -17,6 +17,16 @@ bool WalFile_IsOpen(const OopWalContext* __restrict WalFile) {
    return (bool)(WalFile->fd != (int)0);
 }
 
+bool WalFile_IsCurrent(const OopWalContext* __restrict WalFile) {
+   struct stat mapped;
+   struct stat on_disk;
+   if (fstat(WalFile->fd, &mapped) != 0)
+      return false;
+   if (stat(WalFile->path, &on_disk) != 0)
+      return false;
+   return mapped.st_dev == on_disk.st_dev && mapped.st_ino == on_disk.st_ino;
+}
+
 bool WalFile_Open(OopWalContext* __restrict WalFile, const char* __restrict Path) {
    strncpy(WalFile->path, Path, sizeof(WalFile->path) - 1);
    WalFile->path[sizeof(WalFile->path) - 1] = '\0';
@@ -244,6 +254,8 @@ bool WalFile_Compact(OopWalContext* WalFile) {
 
    const char* path = WalFile->path;
    size_t len = strlen(path);
+   char reopen[256];
+   memcpy(reopen, path, len + 1);
    char newpath[256];
    memcpy(newpath, path, len);
    newpath[len] = '\0';
@@ -382,10 +394,12 @@ bool WalFile_Compact(OopWalContext* WalFile) {
    }
 
    WalHeader header;
+   memset(&header, 0, sizeof(WalHeader));
    header.magic = WAL_HEADER_MAGIC;
-   header.is_monitoring = 1;
+   header.is_monitoring = oldheader->is_monitoring;
    header.current_offset = _new_offset;
    header.toombstone = (uint32_t)0;
+   header.start_time = oldheader->start_time;
    memcpy(file, &header, sizeof(WalHeader));
    msync(file, WalFile->map_size, MS_SYNC);
    munmap(file, WalFile->map_size);
@@ -396,7 +410,7 @@ bool WalFile_Compact(OopWalContext* WalFile) {
    syscall(SYS_renameat, AT_FDCWD, newpath, AT_FDCWD, path);
 #endif
    WalFile_Close(WalFile);
-   WalFile_Open(WalFile, path);
+   WalFile_Open(WalFile, reopen);
    return true;
 }
 
